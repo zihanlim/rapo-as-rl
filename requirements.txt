@@ -1,0 +1,14 @@
+ccxt==4.3.45
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+hmmlearn==0.3.2
+lightgbm==4.3.0
+stable-baselines3==2.3.2
+gymnasium==0.29.1
+ scipy==1.13.1
+matplotlib==3.8.4
+seaborn==0.13.2
+joblib==1.4.2
+python-dotenv==1.0.1
+jupyter==1.0.0
