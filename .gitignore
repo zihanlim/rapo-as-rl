@@ -45,3 +45,28 @@ Thumbs.db
 # Sandbox/test outputs
 outputs/
 figures/tmp/
+
+# ============================================================
+# PERSONAL & ADMINISTRATIVE — NOT part of capstone submission
+# ============================================================
+# Capstone written documents (submit via portal, not git)
+M1_TopicChoice/
+M2_ProblemStatement/
+M3_LiteratureReview/
+M4_Proposal/
+Topics/
+
+# Personal files
+Career_Planning.md
+LIMZIHAN_Resume_2026.pdf
+
+# Lecture / course materials
+Capstone\ Lecture\ Notes*.zip
+
+# Screenshots and temp files
+*.png
+nul
+
+# Claude Code + tool configs
+.claude/
+.playwright-mcp/
