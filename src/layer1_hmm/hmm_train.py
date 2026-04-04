@@ -52,6 +52,8 @@ def build_hmm_features(price_df: pd.DataFrame, trades_df: pd.DataFrame) -> pd.Da
         Feature matrix indexed by timestamp, shape (T, n_features)
     """
     df = price_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.set_index("timestamp")  # Use timestamp as index for proper alignment
     df["return"] = np.log(df["close"] / df["close"].shift(1))
     df["realized_vol"] = df["return"].rolling(20).std()
 
@@ -60,12 +62,18 @@ def build_hmm_features(price_df: pd.DataFrame, trades_df: pd.DataFrame) -> pd.Da
 
     # Order flow imbalance from trade ticks
     # Align trades to 5-min bars
-    trades_df["timestamp_bin"] = trades_df["timestamp"].floor("5min")
+    trades_df = trades_df.copy()
+    trades_df["timestamp"] = pd.to_datetime(trades_df["timestamp"])
+    trades_df["timestamp_bin"] = trades_df["timestamp"].dt.floor("5min")
+    trades_df["side_sign"] = trades_df["side"].map({"buy": 1, "sell": -1}).fillna(0)
+
     ofi = (
-        trades_df.groupby("timestamp_bin")["volume"]
-        .apply(lambda x: (x * (trades_df.loc[x.index, "side"] == "buy").astype(int) * 2 - 1).sum())
+        trades_df.groupby("timestamp_bin")
+        .apply(lambda x: (x["volume"] * x["side_sign"]).sum(), include_groups=False)
     )
-    df["ofi"] = ofi.reindex(df.index).fillna(0).rolling(5).mean()
+    ofi.index = pd.to_datetime(ofi.index)
+    df["ofi"] = ofi.reindex(df.index).fillna(0).values
+    df["ofi"] = df["ofi"].rolling(5).mean()
 
     feature_cols = ["return", "realized_vol", "spread_proxy", "ofi"]
     features = df[feature_cols].dropna()
@@ -82,6 +90,7 @@ def build_hmm_features(price_df: pd.DataFrame, trades_df: pd.DataFrame) -> pd.Da
 def select_states(features: np.ndarray, candidate_states: list[int] = None) -> dict:
     """
     Select optimal number of HMM states using BIC and AIC.
+    Uses multiple random initializations to avoid local optima.
 
     Returns dict with scores per state count.
     """
@@ -90,13 +99,22 @@ def select_states(features: np.ndarray, candidate_states: list[int] = None) -> d
 
     scores = {}
     for n_states in candidate_states:
-        model = GaussianHMM(
-            n_components=n_states,
-            covariance_type="diag",
-            n_iter=500,
-            random_state=42,
-        )
-        model.fit(features)
+        # Run 5 random initializations and pick best
+        best_ll = -np.inf
+        best_model = None
+        for seed in [42, 123, 456, 789, 999]:
+            model = GaussianHMM(
+                n_components=n_states,
+                covariance_type="diag",
+                n_iter=500,
+                random_state=seed,
+            )
+            model.fit(features)
+            ll = model.score(features)
+            if ll > best_ll:
+                best_ll = ll
+                best_model = model
+        model = best_model
         scores[n_states] = {
             "bic": model.bic(features),
             "aic": model.aic(features),
@@ -121,20 +139,33 @@ def train_hmm(
 ) -> GaussianHMM:
     """
     Train final HMM with n_states and label states as Calm / Volatile / Stressed.
+    Uses multiple random initializations to avoid local optima.
     """
-    model = GaussianHMM(
-        n_components=n_states,
-        covariance_type="diag",
-        n_iter=500,
-        random_state=42,
-    )
-    model.fit(features)
+    # Use multiple initializations and pick best
+    best_ll = -np.inf
+    best_model = None
+    for seed in [42, 123, 456, 789, 999]:
+        model = GaussianHMM(
+            n_components=n_states,
+            covariance_type="diag",
+            n_iter=500,
+            random_state=seed,
+        )
+        model.fit(features)
+        ll = model.score(features)
+        if ll > best_ll:
+            best_ll = ll
+            best_model = model
+    model = best_model
     log.info(f"HMM trained: {n_states} states, log-likelihood={model.score(features):.2f}")
 
     # Label states based on mean volatility (lowest vol = Calm, highest = Stressed)
+    # Feature order: 0=return, 1=realized_vol, 2=spread_proxy, 3=ofi
     state_vols = model.means_[:, 1]  # column 1 = realized_vol feature
     sorted_states = np.argsort(state_vols)  # ascending: lowest vol first
-    state_labels = {sorted_states[0]: "Calm", sorted_states[1]: "Volatile", sorted_states[2]: "Stressed"}
+    # Map lowest-vol state to Calm, middle to Volatile, highest to Stressed
+    regime_names = ["Calm", "Volatile", "Stressed"]
+    state_labels = {sorted_states[i]: regime_names[i] for i in range(min(n_states, 3))}
     model.state_labels_ = state_labels
     log.info(f"State labels: {state_labels}")
 
@@ -164,7 +195,10 @@ def main():
     # State selection (BIC/AIC comparison)
     log.info("Running state selection (BIC/AIC)...")
     scores, best_n = select_states(X)
-    n_states = args.n_states if args.n_states != 3 else best_n
+    # Use explicit --n_states if provided, otherwise use BIC-selected best_n
+    n_states = args.n_states if args.n_states is not None else best_n
+    n_states = min(n_states, 3)  # Project uses 3 regimes: Calm/Volatile/Stressed
+    log.info(f"Using n_states={n_states} (BIC best={best_n})")
 
     # Train final model
     model = train_hmm(X, n_states=n_states)

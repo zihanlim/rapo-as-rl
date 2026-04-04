@@ -1,13 +1,5 @@
-from .hmm_regime import HMMRegimeClassifier
-from .as_cost import ASCostModel
-from .lightgbm_forecaster import LightGBMForecaster
-from .rl_agent import RLRebalancingAgent
-from .backtest import BacktestEngine
+# RAPO-AS-RL Capstone Package
+# Individual layer modules are in subdirectories:
+#   src.layer1_hmm, src.layer2_as, src.layer3_lightgbm, src.layer4_rl
 
-__all__ = [
-    "HMMRegimeClassifier",
-    "ASCostModel",
-    "LightGBMForecaster",
-    "RLRebalancingAgent",
-    "BacktestEngine",
-]
+__version__ = "0.1.0"

@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.nn import ReLU
 from stable_baselines3 import PPO
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -73,9 +75,9 @@ def train_regime_ppo(env, regime: str, n_timesteps: int = 1_000_000) -> PPO:
             learning_rate=params["learning_rate"],
             gamma=params["gamma"],
             clip_range=params["clip_range"],
-            policy_kwargs={"net_arch": [64, 64], "activation_fn": "ReLU"},
+            policy_kwargs={"net_arch": [64, 64], "activation_fn": ReLU},
             verbose=0,
-            random_seed=42,
+            seed=42,
         )
 
         # Train with early stopping evaluation
@@ -98,10 +100,11 @@ def train_regime_ppo(env, regime: str, n_timesteps: int = 1_000_000) -> PPO:
             rs = rolling_sharpe(eval_rewards)
             reward_buffer.extend(eval_rewards)
 
-            # Early stopping check
-            if len(reward_buffer) >= 100:
+            # Early stopping check: requires at least 50,000 rewards for stable comparison
+            if len(reward_buffer) >= 50_000:
                 current_sharpe = rolling_sharpe(reward_buffer)
-                if abs(current_sharpe - rolling_sharpe(reward_buffer[:-50_000])) < 0.05:
+                prev_sharpe = rolling_sharpe(reward_buffer[:-50_000])
+                if abs(current_sharpe - prev_sharpe) < 0.05:
                     stable_count += 1
                 else:
                     stable_count = 0
@@ -130,15 +133,21 @@ def main():
     parser.add_argument("--as_cost", type=str, default="models/as_cost")
     parser.add_argument("--lgbm", type=str, default="models/lgbm")
     parser.add_argument("--output", type=str, default="models/rl")
-    parser.add_argument("--n_timesteps", type=int, default=1_000_000)
+    parser.add_argument("--n_timesteps", type=int, default=300_000)
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load data
+    # Load data with DatetimeIndex from timestamp column
     price_df = pd.read_parquet(Path(args.data) / "price_features.parquet")
-    regime_labels = pd.read_csv(args.regime, index_col=0, squeeze=True)
+    if 'timestamp' in price_df.columns:
+        price_df = price_df.set_index('timestamp')
+        price_df.index = pd.to_datetime(price_df.index)
+
+    # Load regime labels
+    regime_labels = pd.read_csv(args.regime, index_col=0)
+    regime_labels = regime_labels.iloc[:, 0] if regime_labels.ndim > 1 else regime_labels.squeeze()
     regime_labels.index = pd.to_datetime(regime_labels.index)
 
     # Load A&S cost models
@@ -149,7 +158,9 @@ def main():
         if pkl_path.exists():
             as_models[regime] = joblib.load(pkl_path)
 
-    # Load LightGBM forecasters
+    # Load LightGBM forecasters (BTC/Calm, BTC/Volatile, ETH/Calm, ETH/Volatile)
+    # For stressed regime, use synthetic forecasters since no stressed model exists
+    from src.layer4_rl.rl_env import SyntheticForecaster
     lgbm_models = {}
     for asset in ["BTC", "ETH"]:
         lgbm_models[asset] = {}
@@ -157,6 +168,9 @@ def main():
             pkl_path = Path(args.lgbm) / f"lgbm_{asset.lower()}_{regime.lower()}.pkl"
             if pkl_path.exists():
                 lgbm_models[asset][regime] = joblib.load(pkl_path)
+            else:
+                # Use synthetic forecaster for stressed regime
+                lgbm_models[asset][regime] = SyntheticForecaster(regime, asset)
 
     # Create environment
     from src.layer4_rl.rl_env import RegimePortfolioEnv
