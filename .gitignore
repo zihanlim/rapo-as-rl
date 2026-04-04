@@ -23,10 +23,7 @@ data/raw/*.parquet
 data/raw/*.pkl
 !data/raw/.gitkeep
 
-# Model files
-models/**/*.pkl
-models/**/*.zip
-models/**/*.joblib
+# Model files - track these
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
@@ -77,5 +74,4 @@ notebooks/data/
 notebooks/models/
 notebooks/checkpoints/
 
-# Processed data (large binary data, keep separate)
-data/processed/
+# Processed data

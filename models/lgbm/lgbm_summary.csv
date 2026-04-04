@@ -1,0 +1,5 @@
+Asset,Regime,Train R2,Val R2,Best Iter,N Train,N Val
+BTC,Calm,0.0056,-0.0015,1,5788,1447
+BTC,Volatile,0.0774,-0.1518,37,1104,276
+ETH,Calm,0.0056,-0.0026,1,5788,1447
+ETH,Volatile,0.0632,-0.0434,14,1104,276

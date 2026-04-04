@@ -1,0 +1,120 @@
+{
+  "validated_at": "2026-04-04T10:38:09.550398",
+  "checks": {
+    "files": "PASSED",
+    "date_range": "PARTIAL",
+    "nulls": "WARNING"
+  },
+  "stats": {
+    "price_nulls": {
+      "total_rows": 8656,
+      "null_counts": {
+        "timestamp": 0,
+        "open": 0,
+        "high": 0,
+        "low": 0,
+        "close": 0,
+        "volume": 0,
+        "btc_close": 0,
+        "eth_close": 0,
+        "btc_return": 1,
+        "eth_return": 1,
+        "realized_vol": 20,
+        "spread_proxy": 0,
+        "btc_return_lag_1": 2,
+        "btc_return_lag_3": 4,
+        "btc_return_lag_6": 7,
+        "eth_return_lag_1": 2,
+        "eth_return_lag_3": 4,
+        "eth_return_lag_6": 7,
+        "btc_return_for_eth_model": 1,
+        "eth_return_for_btc_model": 1
+      },
+      "null_pct": {
+        "timestamp": 0.0,
+        "open": 0.0,
+        "high": 0.0,
+        "low": 0.0,
+        "close": 0.0,
+        "volume": 0.0,
+        "btc_close": 0.0,
+        "eth_close": 0.0,
+        "btc_return": 0.01,
+        "eth_return": 0.01,
+        "realized_vol": 0.23,
+        "spread_proxy": 0.0,
+        "btc_return_lag_1": 0.02,
+        "btc_return_lag_3": 0.05,
+        "btc_return_lag_6": 0.08,
+        "eth_return_lag_1": 0.02,
+        "eth_return_lag_3": 0.05,
+        "eth_return_lag_6": 0.08,
+        "btc_return_for_eth_model": 0.01,
+        "eth_return_for_btc_model": 0.01
+      }
+    },
+    "trades_nulls": {
+      "total_rows": 8656,
+      "null_counts": {
+        "timestamp": 0,
+        "side": 0,
+        "volume": 0,
+        "price": 0
+      },
+      "null_pct": {
+        "timestamp": 0.0,
+        "side": 0.0,
+        "volume": 0.0,
+        "price": 0.0
+      }
+    },
+    "returns": {
+      "btc_return": {
+        "mean": 9.26105063182858e-05,
+        "std": 0.012212596404170094,
+        "min": -0.02324854605810122,
+        "max": 1.1087154277998024,
+        "skew": 86.45594986433122,
+        "kurtosis": 7849.152527774646,
+        "annualized_vol": 3.2900653114093372
+      },
+      "eth_return": {
+        "mean": 2.9127154390337313e-06,
+        "std": 0.004341981335346619,
+        "min": -0.023248546058101106,
+        "max": 0.31483221818192614,
+        "skew": 44.016966831047576,
+        "kurtosis": 3194.7628923176276,
+        "annualized_vol": 1.1697268706376667
+      }
+    },
+    "regimes": {
+      "Calm": {
+        "count": 2850,
+        "pct": 33.00138953219083
+      },
+      "Volatile": {
+        "count": 2936,
+        "pct": 33.997220935618344
+      },
+      "Stressed": {
+        "count": 2850,
+        "pct": 33.00138953219083
+      },
+      "thresholds": {
+        "q33": 0.001639496377421305,
+        "q67": 0.0027587737307326822
+      }
+    },
+    "correlation": {
+      "overall": 0.896191266547984,
+      "by_regime": {
+        "Calm": 0.933318074017053,
+        "Volatile": 0.9907027372841833,
+        "Stressed": 0.9244720696197538
+      }
+    }
+  },
+  "synthetic_data": false,
+  "overall": "FAILED"
+}

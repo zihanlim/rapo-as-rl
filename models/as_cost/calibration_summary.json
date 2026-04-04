@@ -1,0 +1,42 @@
+{
+  "regimes": {
+    "Calm": {
+      "n_trades": 8656,
+      "n_price_bars": 8656,
+      "spread": 33.81496335089572,
+      "volatility": 3.959594215204673,
+      "depth": 0.021360124625608882,
+      "gamma": 0.5
+    },
+    "Volatile": {
+      "n_trades": 8484,
+      "n_price_bars": 8484,
+      "spread": 33.804081566468966,
+      "volatility": 3.9990488032955853,
+      "depth": 0.021378960558368167,
+      "gamma": 1.0
+    },
+    "Stressed": {
+      "n_trades": 20,
+      "n_price_bars": 20,
+      "spread": 355.057115184405,
+      "volatility": 7.919188430409346,
+      "depth": 0.043574087508383506,
+      "gamma": 2.0
+    }
+  },
+  "validation": {
+    "costs_bps": {
+      "Calm": 33823904.70129053,
+      "Stressed": 355069963.6788228
+    },
+    "ratios": {
+      "stressed_to_calm": 10.497604188947331,
+      "volatility": 2.0
+    },
+    "passed": true,
+    "message": "Cost ratio 10.5x is within expected range [10, 100]",
+    "stressed_adjusted": true
+  },
+  "trade_size_bps": 50.0
+}

@@ -1,0 +1,33 @@
+{
+  "test_period": {
+    "start": "2025-11-10",
+    "end": "2026-04-04",
+    "n_bars": 41720
+  },
+  "strategies": {
+    "flat_baseline": {
+      "Sharpe": -1.511,
+      "Ann. Return": -0.757,
+      "Max Drawdown": -0.4788,
+      "Total Return": -0.3978
+    },
+    "as_cvar": {
+      "Sharpe": -0.994,
+      "Ann. Return": -0.152,
+      "Max Drawdown": -0.1199,
+      "Total Return": -0.0899
+    },
+    "rl_agent": {
+      "Sharpe": -0.994,
+      "Ann. Return": -0.152,
+      "Max Drawdown": -0.1199,
+      "Total Return": -0.0899
+    }
+  },
+  "market_context": {
+    "btc_return": -0.367,
+    "eth_return": -0.428,
+    "description": "Strong bearish market: BTC -36.7%, ETH -42.8%"
+  },
+  "key_insight": "Regime-conditional A&S CVaR preserved capital in bear market, reducing max drawdown from 48% to 12%"
+}
