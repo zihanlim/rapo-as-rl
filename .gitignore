@@ -71,3 +71,11 @@ nul
 # Claude Code + tool configs
 .claude/
 .playwright-mcp/
+
+# Duplicate data in notebooks (keep separate from root data/)
+notebooks/data/
+notebooks/models/
+notebooks/checkpoints/
+
+# Processed data (large binary data, keep separate)
+data/processed/
