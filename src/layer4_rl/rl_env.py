@@ -198,6 +198,60 @@ def create_synthetic_regime_labels(n_bars: int, price_data: pd.DataFrame) -> pd.
     return pd.Series(regimes, index=price_data.index, name="regime")
 
 
+def create_regime_filtered_env(price_data, regime_labels, as_cost_models, forecasters, target_regime, initial_balance=100_000, obs_normalization=None):
+    """
+    Create an environment that filters data to only include contiguous segments
+    of the target regime. Each contiguous segment becomes its own episode.
+
+    This enables proper regime-conditional RL training where each regime's policy
+    learns only from its own regime's data.
+
+    Parameters
+    ----------
+    obs_normalization : tuple (mean, std) or None
+        If provided, use these pre-computed normalization stats (from full dataset).
+        If None, computes from filtered data (not recommended).
+    """
+    # Find contiguous regime segments
+    segments = []
+    current_start = 0
+    current_regime = regime_labels.iloc[0]
+
+    for i in range(1, len(regime_labels)):
+        if regime_labels.iloc[i] != current_regime:
+            if current_regime == target_regime:
+                segments.append((current_start, i))
+            current_start = i
+            current_regime = regime_labels.iloc[i]
+
+    if current_regime == target_regime:
+        segments.append((current_start, len(regime_labels)))
+
+    if not segments:
+        raise ValueError(f"No data found for regime: {target_regime}")
+
+    filtered_dfs = []
+    for start, end in segments:
+        filtered_dfs.append(price_data.iloc[start:end])
+
+    filtered_price = pd.concat(filtered_dfs)
+    filtered_regime = pd.concat([regime_labels.iloc[start:end] for start, end in segments])
+
+    filtered_regime.index = range(len(filtered_regime))
+    filtered_price.index = range(len(filtered_price))
+
+    env = RegimePortfolioEnv(
+        price_data=filtered_price,
+        regime_labels=filtered_regime,
+        as_cost_models=as_cost_models,
+        forecasters=forecasters,
+        initial_balance=initial_balance,
+    )
+    # Use pre-computed normalization from FULL dataset (not filtered data)
+    if obs_normalization is not None:
+        env._obs_mean, env._obs_std = obs_normalization
+    return env
+
 class RegimePortfolioEnv(gym.Env):
     """
     Regime-conditional portfolio rebalancing environment.
@@ -207,7 +261,7 @@ class RegimePortfolioEnv(gym.Env):
     price_data : pd.DataFrame
         OHLCV data with btc_close, eth_close columns
     regime_labels : pd.Series
-        HMM regime labels indexed by timestamp
+        HMM regime labels indexed by timestamp (0-based int or string)
     as_cost_models : dict
         Per-regime A&S cost model dicts {regime: params_dict}
     forecasters : dict
@@ -243,6 +297,10 @@ class RegimePortfolioEnv(gym.Env):
         self._max_episode_steps = self.max_t + 1
         self._elapsed_steps = 0
 
+        # PPO is sensitive to observation scales. Compute normalization stats
+        # from all data upfront so training and backtest use the SAME stats.
+        self._compute_obs_normalization(price_data, regime_labels, as_cost_models, forecasters)
+
         # Observation space: 11 dimensions
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
@@ -271,6 +329,57 @@ class RegimePortfolioEnv(gym.Env):
         self.portfolio_value = self.initial_balance
         return self._get_obs(), {}
 
+    def _compute_obs_normalization(self, price_data, regime_labels, as_cost_models, forecasters):
+        """Pre-compute observation mean/std from ALL data for stable PPO training."""
+        samples = []
+        for t in range(len(price_data) - 1):
+            t_idx = t
+            if isinstance(regime_labels.index[0], (int, np.integer)):
+                regime_str = regime_labels.iloc[t_idx] if t_idx < len(regime_labels) else "Calm"
+            else:
+                ts = price_data.index[t_idx]
+                regime_str = regime_labels.get(ts, "Calm")
+            regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
+            cost_model = as_cost_models.get(regime_str, {})
+            # Use actual historical return as mu proxy so that obs_std reflects
+            # the true scale of return observations. At runtime, LGBM will
+            # override mu values, but obs_std keeps normalization stable.
+            asset_prefixes = ["btc", "eth"]
+            mu_values = []
+            for prefix in asset_prefixes:
+                ret_col = f"{prefix}_return"
+                if ret_col in price_data.columns:
+                    mu_values.append(float(price_data[ret_col].iloc[t_idx]))
+                else:
+                    mu_values.append(0.0)
+            mu_btc, mu_eth = mu_values[0], mu_values[1]
+            sigma_port = 0.01
+            samples.append([
+                0.5, 0.5, 0.0, float(regime_idx),
+                mu_btc, mu_eth,
+                cost_model.get("volatility", 0.0),
+                cost_model.get("spread", 0.0),
+                cost_model.get("depth", 0.0),
+                sigma_port, 0.0,
+            ])
+        samples = np.array(samples, dtype=np.float32)
+        self._obs_mean = np.mean(samples, axis=0)
+        self._obs_std = np.std(samples, axis=0)
+        # Weights (0-1), regime (0-2), sigma_port, cum_pnl: no normalization needed
+        self._obs_std[0:4] = 1e8   # effectively no normalization
+        self._obs_std[9] = 1e8     # sigma_port — don't normalize (varies at runtime)
+        self._obs_std[10] = 1e8   # cum_pnl
+        # For mu_btc/mu_eth/vol/spread/depth: ensure minimum std
+        # so that runtime values don't produce extreme normalized values.
+        # mu_btc/mu_eth have scale ~1e-3 to 1e-2; use MIN_STD=1e-5 to keep
+        # normalized values within ~[-100, 100] before clipping to [-10, 10]
+        MIN_STD = 1e-5
+        for i in [4, 5, 6, 7, 8]:
+            if self._obs_std[i] < MIN_STD:
+                self._obs_std[i] = MIN_STD
+        self._obs_count = len(samples)
+
+
     def step(self, action: np.ndarray):
         """Execute one 5-min trading period."""
         # Normalize action to valid weight simplex
@@ -284,8 +393,14 @@ class RegimePortfolioEnv(gym.Env):
         target_weights = target_weights / (target_weights.sum() + 1e-8)
 
         # Get current regime and cost model
-        ts = self.price_data.index[self.t]
-        regime_str = self.regime_labels.get(ts, "Calm")
+        # Handle both integer index (filtered env) and datetime index (full env)
+        if isinstance(self.regime_labels.index[0], (int, np.integer)):
+            # Integer-indexed (filtered regime env): use self.t directly
+            regime_str = self.regime_labels.iloc[self.t] if self.t < len(self.regime_labels) else "Calm"
+        else:
+            # Datetime-indexed (full env): look up by timestamp
+            ts = self.price_data.index[self.t]
+            regime_str = self.regime_labels.get(ts, "Calm")
         regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
         cost_model = self.as_cost_models.get(regime_str, {})
 
@@ -307,15 +422,17 @@ class RegimePortfolioEnv(gym.Env):
         cost_eth = self._as_cost(trade_value[1], eth_price, cost_model)
         total_cost = cost_btc + cost_eth
 
-        # Net reward: risk-adjusted return net of cost
-        # realized_pnl already accounts for costs via total_cost
-        realized_pnl = self.portfolio_value * portfolio_return - total_cost
-        sigma_port = self._rolling_volatility()
-        reward = realized_pnl / (sigma_port + 1e-8)
+        # Net reward: fractional portfolio return minus fractional cost
+        # Scale rewards to put them in a range PPO handles well (~[-1, 1])
+        REWARD_SCALE = 100.0
+        reward = (portfolio_return - (total_cost / self.portfolio_value)) * REWARD_SCALE
 
-        # Update state
+        # Update state — portfolio_value update must be in dollars to stay consistent
+        realized_pnl = self.portfolio_value * portfolio_return - total_cost
         self.cum_pnl += realized_pnl
-        self.current_weights = target_weights
+        # target_weights is [btc, eth]; cash fills the remainder to sum to 1
+        cash_w = 1.0 - target_weights[0] - target_weights[1]
+        self.current_weights = np.array([target_weights[0], target_weights[1], cash_w], dtype=np.float32)
         self.portfolio_value += realized_pnl
         self.t += 1
         self._elapsed_steps += 1
@@ -332,8 +449,15 @@ class RegimePortfolioEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _get_obs(self) -> np.ndarray:
-        ts = self.price_data.index[min(self.t, len(self.price_data) - 1)]
-        regime_str = self.regime_labels.get(ts, "Calm")
+        t_idx = min(self.t, len(self.price_data) - 1)
+        # Handle both integer index (filtered env) and datetime index (full env)
+        if isinstance(self.regime_labels.index[0], (int, np.integer)):
+            # Integer-indexed (filtered regime env): use self.t directly
+            regime_str = self.regime_labels.iloc[t_idx] if t_idx < len(self.regime_labels) else "Calm"
+        else:
+            # Datetime-indexed (full env): look up by timestamp
+            ts = self.price_data.index[t_idx]
+            regime_str = self.regime_labels.get(ts, "Calm")
         regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
         cost_model = self.as_cost_models.get(regime_str, {})
 
@@ -341,7 +465,7 @@ class RegimePortfolioEnv(gym.Env):
         mu_eth = self._forecast("ETH", regime_str)
         sigma_port = self._rolling_volatility()
 
-        return np.array(
+        raw_obs = np.array(
             [
                 self.current_weights[0],
                 self.current_weights[1],
@@ -357,6 +481,12 @@ class RegimePortfolioEnv(gym.Env):
             ],
             dtype=np.float32,
         )
+        # Normalize: (obs - mean) / std for stable PPO training
+        norm_obs = (raw_obs - self._obs_mean) / self._obs_std
+        # Final safety: clip extreme values to prevent PPO NaN
+        norm_obs = np.clip(norm_obs, -10.0, 10.0)
+        norm_obs = np.where(np.isfinite(norm_obs), norm_obs, 0.0)
+        return norm_obs
 
     def _forecast(self, asset: str, regime: str) -> float:
         """Get LightGBM forecast for asset/regime. Returns 0.0 if model unavailable."""
@@ -364,13 +494,21 @@ class RegimePortfolioEnv(gym.Env):
             model = self.forecasters.get(asset, {}).get(regime)
             if model is None:
                 return 0.0
-            # Build features for this timestamp (matching LightGBM training features)
+            # Build features for this timestamp (EXACTLY matching lgbm_train.py feature_cols)
             t_idx = min(self.t, len(self.price_data) - 1)
             row = self.price_data.iloc[t_idx]
-            features = np.array([[
-                row.get(f"{asset.lower()}_return_lag_1", 0.0),
-                row.get(f"{asset.lower()}_return_lag_3", 0.0),
-                row.get(f"{asset.lower()}_return_lag_6", 0.0),
+            asset_prefix = asset.lower()
+            # Feature names must EXACTLY match what LGBM was trained with
+            feature_names = [
+                "return_lag_1", "return_lag_3", "return_lag_6",
+                "realized_vol", "spread_proxy", "ofi", "cross_asset_return",
+                "regime_Calm", "regime_Volatile", "regime_Stressed",
+            ]
+            # Values in the same order as feature_names above
+            feature_values = [
+                row.get(f"{asset_prefix}_return_lag_1", 0.0),
+                row.get(f"{asset_prefix}_return_lag_3", 0.0),
+                row.get(f"{asset_prefix}_return_lag_6", 0.0),
                 row.get("realized_vol", 0.0),
                 row.get("spread_proxy", 0.0),
                 row.get("ofi", 0.0),
@@ -378,9 +516,20 @@ class RegimePortfolioEnv(gym.Env):
                 float(regime == "Calm"),
                 float(regime == "Volatile"),
                 float(regime == "Stressed"),
-            ]], dtype=np.float32)
-            return float(model.predict(features)[0])
-        except Exception:
+            ]
+            # Use DataFrame with correct feature names to avoid sklearn warning
+            features = pd.DataFrame([feature_values], columns=feature_names)
+            pred = model.predict(features)[0]
+            if np.isnan(pred) or np.isinf(pred):
+                return 0.0
+            return float(pred)
+        except Exception as e:
+            # Only log once per 1000 steps to avoid spam
+            if self.t % 1000 == 0:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Forecast failed for {asset}/{regime} at step {self.t}: {e}"
+                )
             return 0.0
 
     def _as_cost(self, trade_value: float, price: float, cost_model: dict) -> float:
