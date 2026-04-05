@@ -88,14 +88,12 @@ def train_regime_ppo(env, regime: str, n_timesteps: int = 1_000_000) -> tuple:
             device="cpu",         # CPU for numerical stability
             policy_kwargs={"net_arch": [64, 64], "activation_fn": ReLU},
             ent_coef=0.01,        # Light exploration bonus
-        )
-        # Initialize log_std to moderate value to prevent policy collapse
-        with torch.no_grad():
-            model.policy.log_std.data = torch.tensor([-0.3, -0.3])
             verbose=0,
             seed=42,
-            ent_coef=0.01,        # Encourage exploration
         )
+        # Initialize log_std to lower value to prevent policy collapse
+        with torch.no_grad():
+            model.policy.log_std.data = torch.tensor([-0.5, -0.5])
 
         # Train with evaluation every 5K steps
         # Early stopping: after at least 3 eval windows, if last 3 Sharpe values

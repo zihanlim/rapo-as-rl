@@ -1,19 +1,20 @@
 """
-Stable RL Training Script — regime-conditional PPO with chunked training.
+Stable RL Training Script — full-environment training with validation-based selection.
 
-CRITICAL FIXES from previous iterations:
-1. FIXED current_weights bug: step() was overwriting 3-element [btc,eth,cash]
-   array with 2-element action, corrupting observation index 2.
-2. FIXED sigma_port obs_std=0 bug: sigma_port=0.01 constant in normalization
-   samples caused obs_std[9]=0, leading to division-by-zero NaN.
-   Now obs_std[9]=1e8 (no normalization for sigma_port).
-3. FIXED mu normalization: uses actual historical returns for obs_std
-   computation, giving realistic normalized mu values (~[-0.15, 0.09]).
-4. FIXED reset_num_timesteps=True: prevents SB3 buffer-related NaN trigger.
+Fixes from regime-conditional approach:
+1. Full environment training: single PPO learns across all regimes
+2. log_std=-0.5: better exploration
+3. Validation-based early stopping: prevent overfitting
+4. Longer training: 100k steps
+5. Market context features in observations (from rl_env.py fixes)
+6. Reward shaping with churn + drawdown penalties (from rl_env.py fixes)
 
-NOTE: Volatile/Stressed regimes with extreme observations (vol=17, depth=-508
-for Stressed) may require ultra-conservative params (16-16 net, lr=1e-7).
-For those regimes, the Calm model is used as fallback.
+Key design:
+- Single PPO policy trained on FULL RegimePortfolioEnv
+- Regime context provided via obs[3] (regime index: 0=Calm, 1=Volatile, 2=Stressed)
+- Train/Val/Test: 20 days train, 5 days val, rest test
+- Early stopping on validation Sharpe ratio
+- Best validation model saved to models/rl/ppo_full.zip
 """
 import warnings
 warnings.filterwarnings('ignore')
@@ -26,7 +27,7 @@ import torch.nn as nn
 from pathlib import Path
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from src.layer4_rl.rl_env import RegimePortfolioEnv, create_regime_filtered_env
+from src.layer4_rl.rl_env import RegimePortfolioEnv
 import joblib
 import json
 import logging
@@ -34,36 +35,84 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# Regime-specific params: more conservative for harder regimes
-# Calm: 16-16 net, lr=1e-7, clip=0.05 — ultra-conservative for stability
-# Volatile/Stressed: same but use Calm model if training fails
+# Annualization factor for 5-min bars
+ANN_FACTOR = 288 * 365
+
+# PPO hyperparameters — ultra-conservative for stability
 REGIME_PARAMS = {
-    'Calm':    {'net_arch': [16, 16], 'lr': 1e-7, 'clip': 0.05, 'n_steps': 16, 'batch_size': 16, 'mgn': 0.05, 'log_std': -1.5},
-    'Volatile': {'net_arch': [16, 16], 'lr': 1e-7, 'clip': 0.05, 'n_steps': 16, 'batch_size': 16, 'mgn': 0.05, 'log_std': -1.5},
-    'Stressed': {'net_arch': [16, 16], 'lr': 1e-7, 'clip': 0.05, 'n_steps': 16, 'batch_size': 16, 'mgn': 0.05, 'log_std': -1.5},
+    'full': {'net_arch': [32, 32], 'lr': 3e-5, 'clip': 0.1, 'n_steps': 64, 'batch_size': 16, 'mgn': 0.5, 'log_std': -0.5},
 }
 
-def make_model(vec_env, regime):
-    p = REGIME_PARAMS[regime]
+
+def compute_sharpe(returns):
+    """Compute annualized Sharpe ratio from returns series."""
+    if len(returns) < 2:
+        return 0.0
+    ann_ret = returns.mean() * ANN_FACTOR
+    ann_vol = returns.std() * np.sqrt(ANN_FACTOR)
+    return ann_ret / (ann_vol + 1e-8)
+
+
+def make_model(vec_env):
+    """Create PPO model with ultra-conservative hyperparameters."""
+    p = REGIME_PARAMS['full']
     model = PPO(
         'MlpPolicy', vec_env,
-        learning_rate=p['lr'], gamma=0.99, clip_range=p['clip'],
-        n_steps=p['n_steps'], batch_size=p['batch_size'],
-        max_grad_norm=p['mgn'], device='cpu',
-        policy_kwargs={'net_arch': p['net_arch'], 'activation_fn': nn.ReLU},
-        verbose=0, seed=42, n_epochs=1, ent_coef=0.0,
+        learning_rate=p['lr'],
+        gamma=0.99,
+        clip_range=p['clip'],
+        n_steps=p['n_steps'],
+        batch_size=p['batch_size'],
+        max_grad_norm=p['mgn'],
+        device='cpu',
+        policy_kwargs={
+            'net_arch': p['net_arch'],
+            'activation_fn': nn.ReLU,
+        },
+        verbose=0,
+        seed=42,
+        n_epochs=1,
+        ent_coef=0.0,
     )
+    # Initialize log_std to -0.5 for better exploration
     model.policy.log_std.data = torch.tensor([p['log_std'], p['log_std']])
     return model
 
+
 def check_nan(model):
+    """Check if model weights contain NaN or Inf."""
     w = model.policy.action_net.weight.data
     return not torch.isfinite(w).all()
 
-def rolling_sharpe(rewards, window=100):
-    if len(rewards) < window:
-        return 0.0
-    return np.mean(rewards[-window:]) / (np.std(rewards[-window:]) + 1e-8)
+
+def collect_episode_returns(env, model, deterministic=True, max_steps=2000):
+    """Collect returns from one complete episode for Sharpe evaluation."""
+    obs, _ = env.reset()
+    episode_rewards = []
+    done = truncated = False
+    steps = 0
+
+    while not (done or truncated) and steps < max_steps:
+        action, _ = model.predict(obs, deterministic=deterministic)
+        obs, reward, done, truncated, info = env.step(action)
+        episode_rewards.append(reward)
+        steps += 1
+
+    return np.array(episode_rewards)
+
+
+def evaluate_on_env(env, model, n_episodes=3):
+    """Evaluate model on environment, return mean Sharpe of episodes."""
+    all_episode_sharpes = []
+
+    for _ in range(n_episodes):
+        returns = collect_episode_returns(env, model, deterministic=True)
+        if len(returns) >= 2:
+            sharpe = compute_sharpe(pd.Series(returns))
+            all_episode_sharpes.append(sharpe)
+
+    return np.mean(all_episode_sharpes) if all_episode_sharpes else 0.0
+
 
 def main():
     DATA_DIR = Path('data/processed')
@@ -73,21 +122,60 @@ def main():
     OUTPUT_DIR = Path('models/rl')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # -------------------------------------------------------------------------
     # Load data
+    # -------------------------------------------------------------------------
+    log.info('Loading data...')
     price_df = pd.read_parquet(DATA_DIR / 'price_features.parquet')
     if 'timestamp' in price_df.columns:
         price_df = price_df.set_index('timestamp')
     price_df.index = pd.to_datetime(price_df.index)
+    log.info(f'  Price data: {price_df.shape}, range: {price_df.index.min()} to {price_df.index.max()}')
 
     regime_labels = pd.read_csv(REGIME_PATH, index_col=0).iloc[:, 0]
     regime_labels.index = pd.to_datetime(regime_labels.index)
+    log.info(f'  Regime labels: {len(regime_labels)} entries, range: {regime_labels.index.min()} to {regime_labels.index.max()}')
 
+    # Align regime_labels to price_df index (forward-fill missing at start)
+    regime_labels_aligned = regime_labels.reindex(price_df.index)
+    regime_labels_aligned = regime_labels_aligned.fillna('Calm')
+    log.info(f'  Regime labels aligned to price_df: {len(regime_labels_aligned)} entries')
+
+    # -------------------------------------------------------------------------
+    # Train/Val/Test split: 20 days train, 5 days val, rest test
+    # -------------------------------------------------------------------------
+    data_min = price_df.index.min()
+    TRAIN_END = data_min + pd.Timedelta(days=20)
+    VAL_END = data_min + pd.Timedelta(days=25)
+
+    train_mask = price_df.index <= TRAIN_END
+    val_mask = (price_df.index > TRAIN_END) & (price_df.index <= VAL_END)
+    test_mask = price_df.index > VAL_END
+
+    price_train = price_df[train_mask]
+    price_val = price_df[val_mask]
+    price_test = price_df[test_mask]
+
+    regime_train = regime_labels_aligned[train_mask]
+    regime_val = regime_labels_aligned[val_mask]
+    regime_test = regime_labels_aligned[test_mask]
+
+    log.info(f'  Train: {len(price_train)} bars ({price_train.index.min().date()} to {price_train.index.max().date()})')
+    log.info(f'  Val:   {len(price_val)} bars ({price_val.index.min().date()} to {price_val.index.max().date()})')
+    log.info(f'  Test:  {len(price_test)} bars ({price_test.index.min().date()} to {price_test.index.max().date()})')
+
+    # -------------------------------------------------------------------------
     # Load cost models
+    # -------------------------------------------------------------------------
+    log.info('Loading A&S cost models...')
     as_models = {}
     for regime in ['Calm', 'Volatile', 'Stressed']:
         as_models[regime] = joblib.load(AS_DIR / f'as_cost_{regime.lower()}.pkl')
 
+    # -------------------------------------------------------------------------
     # Load LGBM forecasters
+    # -------------------------------------------------------------------------
+    log.info('Loading LightGBM forecasters...')
     from src.layer4_rl.rl_env import SyntheticForecaster
     lgbm_models = {}
     for asset in ['BTC', 'ETH']:
@@ -98,67 +186,148 @@ def main():
                 lgbm_models[asset][regime] = joblib.load(pkl_path)
             else:
                 lgbm_models[asset][regime] = SyntheticForecaster(regime, asset)
+    log.info('  Loaded LGBM forecasters for BTC/ETH x Calm/Volatile/Stressed')
 
-    # Pre-compute normalization from full dataset
-    log.info('Computing observation normalization from full dataset...')
-    full_env = RegimePortfolioEnv(price_df, regime_labels, as_models, lgbm_models)
-    obs_norm = (full_env._obs_mean, full_env._obs_std)
+    # -------------------------------------------------------------------------
+    # Create full-data environment for observation normalization
+    # -------------------------------------------------------------------------
+    log.info('Computing observation normalization from FULL dataset...')
+    full_env_for_norm = RegimePortfolioEnv(
+        price_df, regime_labels_aligned, as_models, lgbm_models
+    )
+    obs_norm = (full_env_for_norm._obs_mean, full_env_for_norm._obs_std)
     log.info(f'  obs_std[4:10]: {obs_norm[1][[4,5,6,7,8,9]].round(6)}')
 
-    TRAIN_STEPS = 30_000
-    CHUNK = 500
-    CHUNKS_PER_REGIME = TRAIN_STEPS // CHUNK
+    # -------------------------------------------------------------------------
+    # Create training and validation environments (TRAIN SPLIT ONLY for training)
+    # -------------------------------------------------------------------------
+    log.info('Creating training environment (train split, all regimes)...')
+    train_env = RegimePortfolioEnv(
+        price_train, regime_train, as_models, lgbm_models
+    )
+    train_env._obs_mean, train_env._obs_std = obs_norm
+    vec_train = DummyVecEnv([lambda: train_env])
 
-    for regime in ['Calm', 'Volatile', 'Stressed']:
-        log.info(f'\n=== Training regime: {regime} ===')
-        model_path = OUTPUT_DIR / f'ppo_{regime.lower()}.zip'
+    log.info('Creating validation environment (val split)...')
+    val_env = RegimePortfolioEnv(
+        price_val, regime_val, as_models, lgbm_models
+    )
+    val_env._obs_mean, val_env._obs_std = obs_norm
 
-        env = create_regime_filtered_env(
-            price_df, regime_labels, as_models, lgbm_models,
-            target_regime=regime, initial_balance=100_000.0,
-            obs_normalization=obs_norm,
-        )
-        log.info(f'  {regime}: {len(env.price_data)} bars, max_t={env.max_t}')
-        vec_env = DummyVecEnv([lambda: env])
+    # -------------------------------------------------------------------------
+    # Training loop with validation-based early stopping
+    # -------------------------------------------------------------------------
+    TOTAL_STEPS = 100_000
+    CHUNK = 500  # Train in chunks
+    EVAL_EVERY = 2500  # Evaluate on validation every 2500 steps
+    PATIENCE = 3  # Stop if no improvement for 3 consecutive evaluations
 
+    log.info(f'\n=== Training PPO on FULL environment: {TOTAL_STEPS} steps ===')
+    log.info(f'  Chunk size: {CHUNK}, Eval every: {EVAL_EVERY}, Patience: {PATIENCE}')
+
+    model = make_model(vec_train)
+
+    best_model_path = OUTPUT_DIR / 'ppo_full.zip'
+    total_timesteps = 0
+    reinit_count = 0
+    eval_count = 0
+
+    # Validation tracking
+    best_val_sharpe = -np.inf
+    best_model_state = None
+    no_improve_count = 0
+
+    while total_timesteps < TOTAL_STEPS:
+        # Train for CHUNK steps
         try:
-            model = make_model(vec_env, regime)
-            total_steps = 0
-            chunk_results = []
+            model.learn(CHUNK, progress_bar=False, reset_num_timesteps=True)
+            total_timesteps += CHUNK
+            reinit_count = 0
+        except (ValueError, RuntimeError) as e:
+            if 'NaN' in str(e) or 'invalid values' in str(e) or 'inf' in str(e):
+                reinit_count += 1
+                if reinit_count > 3:
+                    log.error(f'  Too many NaN errors ({reinit_count}), stopping training.')
+                    break
+                log.warning(f'  NaN/Invalid error at {total_timesteps} steps! Reinitializing...')
+                del model
+                model = make_model(vec_train)
+                no_improve_count = 0  # Reset patience on reinit
+                continue
+            else:
+                raise
 
-            for chunk_idx in range(CHUNKS_PER_REGIME):
-                model.learn(CHUNK, progress_bar=False, reset_num_timesteps=True)
-                total_steps += CHUNK
+        # Check for NaN after training
+        if check_nan(model):
+            log.warning(f'  NaN detected after training at {total_timesteps} steps! Reinitializing...')
+            del model
+            model = make_model(vec_train)
+            no_improve_count = 0  # Reset patience on reinit
+            continue
 
-                if check_nan(model):
-                    log.warning(f'  NaN at chunk {chunk_idx+1}! Reinitializing...')
-                    del model
-                    model = make_model(vec_env, regime)
-                    model.learn(CHUNK, progress_bar=False, reset_num_timesteps=True)
-                    total_steps += CHUNK
+        # Log progress every 10 chunks (5000 steps)
+        if (total_timesteps // CHUNK) % 10 == 0:
+            w = model.policy.action_net.weight.data
+            log.info(f'  Steps {total_timesteps}: weight_mean={w.mean().item():.6f}, NaN={not torch.isfinite(w).all()}')
 
-                if (chunk_idx + 1) % 20 == 0:
-                    w_norm = model.policy.action_net.weight.data.norm().item()
-                    ls = model.policy.log_std.data.exp().mean().item()
-                    log.info(f'  {regime} chunk {chunk_idx+1}/{CHUNKS_PER_REGIME}: '
-                             f'w_norm={w_norm:.4f}, std={ls:.4f}')
+        # Evaluate on validation set every EVAL_EVERY steps
+        if total_timesteps % EVAL_EVERY == 0 and total_timesteps > 0:
+            eval_count += 1
+            val_sharpe = evaluate_on_env(val_env, model, n_episodes=3)
+            log.info(f'  [Eval #{eval_count}] Steps {total_timesteps}: Val Sharpe = {val_sharpe:.4f} (best={best_val_sharpe:.4f})')
 
-                if (chunk_idx + 1) % 10 == 0:
-                    model.save(str(model_path))
+            if val_sharpe > best_val_sharpe:
+                best_val_sharpe = val_sharpe
+                best_model_state = {k: v.cpu().clone() for k, v in model.policy.state_dict().items()}
+                no_improve_count = 0
+                log.info(f'    *** New best model! Val Sharpe = {best_val_sharpe:.4f} ***')
+            else:
+                no_improve_count += 1
+                log.info(f'    No improvement ({no_improve_count}/{PATIENCE})')
+                if no_improve_count >= PATIENCE:
+                    log.info(f'  Early stopping: no improvement for {PATIENCE} consecutive evaluations.')
+                    break
 
-            model.save(str(model_path))
-            log.info(f'  Saved: {model_path.name} ({total_steps} steps)')
-        except Exception as e:
-            log.error(f'  {regime} training failed: {e}')
-            # Fallback: copy Calm model
-            calm_path = OUTPUT_DIR / 'ppo_calm.zip'
-            if calm_path.exists():
-                import shutil
-                shutil.copy(calm_path, model_path)
-                log.info(f'  Using Calm model as {regime} fallback')
+    # -------------------------------------------------------------------------
+    # Restore best model or save current
+    # -------------------------------------------------------------------------
+    if best_model_state is not None:
+        log.info(f'  Restoring best model with Val Sharpe = {best_val_sharpe:.4f}')
+        model.policy.load_state_dict(best_model_state)
 
-    log.info('\n=== All regimes trained! ===')
-    print(f'\nTraining complete. Models in {OUTPUT_DIR}')
+    model.save(str(best_model_path))
+    log.info(f'\n=== Training complete! ===')
+    log.info(f'  Total steps trained: {total_timesteps}')
+    log.info(f'  Total evaluations: {eval_count}')
+    log.info(f'  Best validation Sharpe: {best_val_sharpe:.4f}')
+    log.info(f'  Model saved to: {best_model_path}')
+
+    # -------------------------------------------------------------------------
+    # Save training summary
+    # -------------------------------------------------------------------------
+    summary = {
+        'total_steps': int(total_timesteps),
+        'best_val_sharpe': float(best_val_sharpe),
+        'final_eval_count': eval_count,
+        'train_split': {
+            'start': str(price_train.index.min().date()),
+            'end': str(price_train.index.max().date()),
+            'n_bars': len(price_train),
+        },
+        'val_split': {
+            'start': str(price_val.index.min().date()),
+            'end': str(price_val.index.max().date()),
+            'n_bars': len(price_val),
+        },
+        'hyperparameters': REGIME_PARAMS['full'],
+    }
+    with open(OUTPUT_DIR / 'training_full_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    log.info(f'  Training summary saved to: {OUTPUT_DIR / "training_full_summary.json"}')
+
+    print(f'\nTraining complete! Best validation Sharpe: {best_val_sharpe:.4f}')
+    print(f'Model saved to: {best_model_path}')
+
 
 if __name__ == '__main__':
     main()

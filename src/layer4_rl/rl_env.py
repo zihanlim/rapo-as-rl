@@ -301,9 +301,9 @@ class RegimePortfolioEnv(gym.Env):
         # from all data upfront so training and backtest use the SAME stats.
         self._compute_obs_normalization(price_data, regime_labels, as_cost_models, forecasters)
 
-        # Observation space: 11 dimensions
+        # Observation space: 14 dimensions
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
         )
 
         # Action space: target BTC and ETH weights
@@ -327,11 +327,53 @@ class RegimePortfolioEnv(gym.Env):
         self.current_weights = np.array([0.5, 0.5, 0.0], dtype=np.float32)
         self.cum_pnl = 0.0
         self.portfolio_value = self.initial_balance
+        self._recent_returns = np.zeros(100)
         return self._get_obs(), {}
 
     def _compute_obs_normalization(self, price_data, regime_labels, as_cost_models, forecasters):
         """Pre-compute observation mean/std from ALL data for stable PPO training."""
         samples = []
+        # Pre-compute rolling volatility and trend for all bars
+        btc_close_vals = price_data["btc_close"].values if "btc_close" in price_data.columns else np.zeros(len(price_data))
+        vol_history = np.zeros(len(price_data))
+        trend_30d_history = np.zeros(len(price_data))
+
+        for t in range(len(price_data)):
+            # Rolling volatility (20-period) for percentile calculation
+            if t >= 20:
+                rets = []
+                for i in range(max(0, t - 20), t):
+                    p = price_data.iloc[i]
+                    ret = np.dot([0.5, 0.5], [p.get("btc_return", 0.0), p.get("eth_return", 0.0)])
+                    rets.append(ret)
+                rets = [r for r in rets if not np.isnan(r)]
+                vol_history[t] = np.std(rets) if len(rets) > 0 else 0.01
+            else:
+                vol_history[t] = 0.01
+
+            # 5-day trend (288 bars per day * 5 = 1440 bars)
+            lookback = 288 * 5
+            if t >= lookback:
+                price_now = btc_close_vals[t]
+                price_then = btc_close_vals[t - lookback]
+                if price_now > 0 and price_then > 0:
+                    trend_30d_history[t] = price_now / price_then - 1
+                else:
+                    trend_30d_history[t] = 0.0
+            else:
+                trend_30d_history[t] = 0.0
+
+        # Volatility percentile: for each t, compare to last 100 bars
+        vol_percentile = np.zeros(len(price_data))
+        for t in range(len(price_data)):
+            window_start = max(0, t - 100)
+            window = vol_history[window_start:t + 1]
+            current_vol = vol_history[t]
+            if len(window) > 1 and np.std(window) > 0:
+                vol_percentile[t] = (current_vol - np.min(window)) / (np.max(window) - np.min(window) + 1e-8)
+            else:
+                vol_percentile[t] = 0.5
+
         for t in range(len(price_data) - 1):
             t_idx = t
             if isinstance(regime_labels.index[0], (int, np.integer)):
@@ -354,6 +396,12 @@ class RegimePortfolioEnv(gym.Env):
                     mu_values.append(0.0)
             mu_btc, mu_eth = mu_values[0], mu_values[1]
             sigma_port = 0.01
+
+            # New market context features
+            trend_30d = float(np.clip(trend_30d_history[t], -1.0, 1.0))
+            vol_pct = float(np.clip(vol_percentile[t], 0.0, 1.0))
+            trend_strength = float(np.clip(abs(trend_30d), 0.0, 1.0))
+
             samples.append([
                 0.5, 0.5, 0.0, float(regime_idx),
                 mu_btc, mu_eth,
@@ -361,6 +409,7 @@ class RegimePortfolioEnv(gym.Env):
                 cost_model.get("spread", 0.0),
                 cost_model.get("depth", 0.0),
                 sigma_port, 0.0,
+                trend_30d, vol_pct, trend_strength,
             ])
         samples = np.array(samples, dtype=np.float32)
         self._obs_mean = np.mean(samples, axis=0)
@@ -369,6 +418,10 @@ class RegimePortfolioEnv(gym.Env):
         self._obs_std[0:4] = 1e8   # effectively no normalization
         self._obs_std[9] = 1e8     # sigma_port — don't normalize (varies at runtime)
         self._obs_std[10] = 1e8   # cum_pnl
+        # New market context features: don't normalize
+        self._obs_std[11] = 1e8   # trend_30d
+        self._obs_std[12] = 1e8   # vol_percentile
+        self._obs_std[13] = 1e8   # trend_strength
         # For mu_btc/mu_eth/vol/spread/depth: ensure minimum std
         # so that runtime values don't produce extreme normalized values.
         # mu_btc/mu_eth have scale ~1e-3 to 1e-2; use MIN_STD=1e-5 to keep
@@ -388,7 +441,7 @@ class RegimePortfolioEnv(gym.Env):
         if target_sum > 1.0:
             target = target / target_sum  # Normalize to sum=1
         target_weights = np.append(target, max(0.0, 1.0 - target.sum())).astype(np.float32)
-        # Ensure valid simplex: w_btc >= 0, w_eth >= 0, w_cash >= 0, sum = 1
+        # Ensure minimum cash weight of 0
         target_weights = np.clip(target_weights, 0.0, 1.0)
         target_weights = target_weights / (target_weights.sum() + 1e-8)
 
@@ -425,7 +478,24 @@ class RegimePortfolioEnv(gym.Env):
         # Net reward: fractional portfolio return minus fractional cost
         # Scale rewards to put them in a range PPO handles well (~[-1, 1])
         REWARD_SCALE = 100.0
-        reward = (portfolio_return - (total_cost / self.portfolio_value)) * REWARD_SCALE
+
+        # Churn penalty: penalize large weight changes
+        delta_weights = target_weights[:2] - self.current_weights[:2]
+        churn_penalty = -0.01 * np.abs(delta_weights).sum()
+
+        # Drawdown penalty: penalize drawdowns
+        cum = np.cumprod(1 + self._recent_returns) if hasattr(self, '_recent_returns') and len(self._recent_returns) > 0 else np.array([1.0])
+        running_max = np.maximum.accumulate(cum)
+        current_drawdown = (cum[-1] - running_max[-1]) / (running_max[-1] + 1e-8) if len(cum) > 0 else 0.0
+        drawdown_penalty = -0.1 * max(0, current_drawdown)
+
+        # Track recent returns for drawdown calculation
+        if not hasattr(self, '_recent_returns'):
+            self._recent_returns = np.zeros(100)
+        self._recent_returns[:-1] = self._recent_returns[1:]
+        self._recent_returns[-1] = portfolio_return
+
+        reward = (portfolio_return - (total_cost / self.portfolio_value)) * REWARD_SCALE + churn_penalty + drawdown_penalty
 
         # Update state — portfolio_value update must be in dollars to stay consistent
         realized_pnl = self.portfolio_value * portfolio_return - total_cost
@@ -465,6 +535,22 @@ class RegimePortfolioEnv(gym.Env):
         mu_eth = self._forecast("ETH", regime_str)
         sigma_port = self._rolling_volatility()
 
+        # Market context features: 5-day trend, volatility percentile, trend strength
+        btc_close_vals = self.price_data["btc_close"].values
+        lookback = 288 * 5
+        if self.t >= lookback and self.t < len(btc_close_vals):
+            price_now = btc_close_vals[self.t]
+            price_then = btc_close_vals[self.t - lookback]
+            if price_now > 0 and price_then > 0:
+                trend_30d = np.clip(price_now / price_then - 1, -1.0, 1.0)
+            else:
+                trend_30d = 0.0
+        else:
+            trend_30d = 0.0
+
+        vol_pct = self._volatility_percentile()
+        trend_strength = np.clip(abs(trend_30d), 0.0, 1.0)
+
         raw_obs = np.array(
             [
                 self.current_weights[0],
@@ -478,6 +564,9 @@ class RegimePortfolioEnv(gym.Env):
                 cost_model.get("depth", 0.0),
                 sigma_port,
                 self.cum_pnl,
+                trend_30d,
+                vol_pct,
+                trend_strength,
             ],
             dtype=np.float32,
         )
@@ -589,6 +678,26 @@ class RegimePortfolioEnv(gym.Env):
         # Filter out NaN values before computing std
         returns = [r for r in returns if not np.isnan(r)]
         return np.std(returns) if len(returns) > 0 else 0.01
+
+    def _volatility_percentile(self) -> float:
+        """Rolling volatility percentile over last 100 bars."""
+        if self.t < 2:
+            return 0.5
+        # Compute rolling volatility over last 100 bars
+        vol_history = []
+        for i in range(max(0, self.t - 100), self.t + 1):
+            p = self.price_data.iloc[i]
+            ret = np.dot([0.5, 0.5], [p.get("btc_return", 0.0), p.get("eth_return", 0.0)])
+            if not np.isnan(ret):
+                vol_history.append(abs(ret))
+        if len(vol_history) < 2:
+            return 0.5
+        current_vol = vol_history[-1] if len(vol_history) > 0 else 0.01
+        min_vol = min(vol_history)
+        max_vol = max(vol_history)
+        if max_vol - min_vol > 1e-8:
+            return np.clip((current_vol - min_vol) / (max_vol - min_vol), 0.0, 1.0)
+        return 0.5
 
     def close(self):
         pass

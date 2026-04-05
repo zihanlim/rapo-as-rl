@@ -87,15 +87,17 @@ log.info(f"  Loaded LGBM forecasters for BTC/ETH x Calm/Volatile/Stressed")
 
 log.info("Loading RL policies...")
 rl_policies = {}
-for regime in ["Calm", "Volatile", "Stressed"]:
-    policy_path = MODEL_DIR / "rl" / f"ppo_{regime.lower()}.zip"
-    if policy_path.exists():
-        rl_policies[regime] = PPO.load(str(policy_path), device="cpu")
-        log.info(f"  Loaded: {regime}")
-    else:
-        log.warning(f"  Missing: {regime}, will use Calm fallback")
-        if "Calm" in rl_policies:
-            rl_policies[regime] = rl_policies["Calm"]
+# Load the single "full" PPO trained on all regimes (regime-aware, not regime-conditional)
+full_path = MODEL_DIR / "rl" / "ppo_full.zip"
+if full_path.exists():
+    rl_policies['full'] = PPO.load(str(full_path), device="cpu")
+    log.info(f"  Loaded: full (regime-aware single PPO)")
+else:
+    log.warning(f"  Missing: ppo_full.zip, will use Calm fallback")
+    calm_path = MODEL_DIR / "rl" / "ppo_calm.zip"
+    if calm_path.exists():
+        rl_policies['full'] = PPO.load(str(calm_path), device="cpu")
+        log.info(f"  Loaded fallback: Calm")
 
 # ----------------------------------------------------------------------
 # Helper functions (from notebook)
@@ -233,7 +235,7 @@ def run_as_cvar_strategy(price_data, regime_labels, as_cost_models, alpha=0.05):
     return portfolio_value, portfolio_value.pct_change().fillna(0), pd.Series(turnover_list, index=price_data.index)
 
 def run_rl_strategy(price_data, regime_labels, as_cost_models, rl_policies, lgbm_forecasters):
-    """Regime-conditional RL agent using RegimePortfolioEnv."""
+    """Regime-aware RL agent using single PPO trained on full environment."""
     try:
         from src.layer4_rl.rl_env import RegimePortfolioEnv
         env = RegimePortfolioEnv(
@@ -248,10 +250,12 @@ def run_rl_strategy(price_data, regime_labels, as_cost_models, rl_policies, lgbm
         turnover_list = []
         done = truncated = False
         steps_run = 0
+
+        # Use single "full" policy trained on all regimes (regime-aware, not regime-conditional)
+        policy = rl_policies.get('full') or rl_policies.get('Calm')
+
         while not (done or truncated):
-            regime_str = get_current_regime(env.price_data.index[env.t], regime_labels)
-            policy = rl_policies.get(regime_str)
-            action = env.current_weights[:2] if policy is None else policy.predict(obs, deterministic=True)[0]
+            action, _ = policy.predict(obs, deterministic=True)
             old_weights = env.current_weights.copy()
             obs, reward, done, truncated, info = env.step(action)
             equity_vals.append(env.portfolio_value)
