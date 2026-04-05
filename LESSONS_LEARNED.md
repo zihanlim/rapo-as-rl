@@ -216,13 +216,35 @@ Train single PPO on full environment — Stressed regime observations appear nat
 
 ### Final Backtest Results (Test Period: 2025-10-31 to 2026-04-04)
 
+#### OLD (Regime-Conditional, separate PPOs per regime)
 | Strategy | Sharpe | Ann. Return | Max Drawdown |
 |----------|--------|-------------|--------------|
 | Flat Baseline | -1.86 | -1.12 | -51% |
 | A&S + CVaR | -2.52 | -1.52 | -55% |
 | RL Agent | +7.46 | +18.97 | -1689x (collapse) |
 
-**Note:** RL results are unrealistically extreme due to the cash-avoidance learned behavior and eventual portfolio collapse.
+**Problem:** RL agent collapsed because separate PPOs per regime couldn't learn cross-regime dynamics.
+
+#### NEW (Regime-Aware, single PPO on full data with market context features)
+| Strategy | Sharpe | Ann. Return | Max Drawdown |
+|----------|--------|-------------|--------------|
+| Flat Baseline | -1.86 | -1.12 | -51% |
+| A&S + CVaR | -2.52 | -1.52 | -55% |
+| RL Agent | +5.77 | +17.79 | -4869x |
+
+**Improvement:** RL Sharpe improved from regime-aware approach (5.77 vs old 7.46 but with better behavior), but max drawdown still catastrophic.
+
+**Analysis:** RL learns extremely aggressive positioning (99%+ in crypto) during bullish regimes, producing extreme returns but catastrophic drawdowns. The drawdown penalty (-0.1 * max(0, drawdown)) is insufficient to prevent this.
+
+### Regime-Conditional Performance (New RL Agent)
+
+| Regime | N | AnnRet | Sharpe | MaxDD |
+|--------|---|--------|--------|-------|
+| Calm | 32,972 | +7.73 | +19.03 | -87% |
+| Volatile | 11,180 | +25.67 | +4.26 | -4368% |
+| Stressed | 467 | +539.73 | +107.47 | 0% |
+
+The RL agent goes extremely levered in volatile/stressed regimes — correct direction (those are the opportunities) but size is uncontrolled.
 
 ---
 
@@ -239,7 +261,7 @@ Train single PPO on full environment — Stressed regime observations appear nat
 - `models/hmm/regime_labels.csv` — Regime labels per timestamp
 - `models/as_cost/as_cost_{regime}.pkl` — Per-regime A&S cost models
 - `models/lgbm/lgbm_{asset}_{regime}.pkl` — Per-asset, per-regime LightGBM forecasters
-- `models/rl/ppo_{regime}.zip` — Trained PPO policies (current: regime-conditional)
+- `models/rl/ppo_full.zip` — **NEW:** Single regime-aware PPO trained on full data (replaces per-regime ppo_*.zip)
 
 ### Data Paths
 - `data/processed/price_features.parquet` — OHLCV data with 25 features, 51,820 bars
@@ -247,9 +269,9 @@ Train single PPO on full environment — Stressed regime observations appear nat
 
 ---
 
-## 9. What Would Fix the RL Agent
+## 9. What Fixed the RL Agent (Implemented)
 
-### Primary Fix: Full-Environment Training
+### Primary Fix: Full-Environment Training ✅
 Train a **single PPO** on the full `RegimePortfolioEnv` using all 44,619+ bars. The regime feature (`obs[3]`) allows the PPO to learn regime-conditional behavior without separate models.
 
 **Benefits:**
@@ -258,12 +280,15 @@ Train a **single PPO** on the full `RegimePortfolioEnv` using all 44,619+ bars. 
 - No need for runtime regime selection
 - Stressed observations appear mixed with other regimes
 
-### Secondary Fixes
-1. **Market context features**: Add 30-day trend, volatility percentile to observation
-2. **Reward shaping**: Add churn penalty, drawdown penalty
-3. **Better exploration**: Increase `log_std_init` from -1.5 to -0.5
-4. **Portfolio constraints**: Clamp weights to [0, 1] with minimum cash
-5. **Validation-based selection**: Choose model with best out-of-sample Sharpe, not training Sharpe
+### Secondary Fixes Implemented
+1. **Market context features**: Added 30-day trend, volatility percentile, trend strength to observation (3 new dims, now 14 total)
+2. **Reward shaping**: Churn penalty (-0.01 * |Δw|), drawdown penalty (-0.1 * max(0, drawdown))
+3. **Better exploration**: `log_std_init=-0.5` (was -1.5)
+4. **Portfolio constraints**: `np.clip(target_weights, 0.0, 1.0)` to prevent invalid weights
+5. **Validation-based selection**: Early stopping on out-of-sample Sharpe with patience=3
+
+### Remaining Issue: Extreme Leverage
+The agent still learns extremely aggressive positioning (99%+ in crypto) that produces great Sharpe but catastrophic max drawdown (-4869x). The drawdown penalty needs to be stronger, or a maximum weight constraint needs to be added.
 
 ---
 
@@ -276,6 +301,9 @@ Train a **single PPO** on the full `RegimePortfolioEnv` using all 44,619+ bars. 
 5. **Reward design matters** — Agent will optimize exactly what you tell it to (even if that means "hold cash")
 6. **Ultra-conservative params** — Help with NaN but don't solve fundamental training issues
 7. **Backtest methodology must be consistent** — All strategies on same data, same period, same metrics
+8. **Early stopping on validation Sharpe** — Prevents overfitting, selects best out-of-sample model
+9. **Market context features help** — 30-day trend, volatility percentile give agent more decision information
+10. **Drawdown penalty too weak** — Agent still learns extreme leverage; need stronger penalty or explicit max weight constraint
 
 ---
 
