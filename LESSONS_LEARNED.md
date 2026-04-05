@@ -216,35 +216,38 @@ Train single PPO on full environment — Stressed regime observations appear nat
 
 ### Final Backtest Results (Test Period: 2025-10-31 to 2026-04-04)
 
-#### OLD (Regime-Conditional, separate PPOs per regime)
+#### BEFORE Fix A+D (Predicted Returns + Raw Reward)
 | Strategy | Sharpe | Ann. Return | Max Drawdown |
 |----------|--------|-------------|--------------|
 | Flat Baseline | -1.86 | -1.12 | -51% |
 | A&S + CVaR | -2.52 | -1.52 | -55% |
-| RL Agent | +7.46 | +18.97 | -1689x (collapse) |
+| RL Agent | +4.58 | +17.79 | -6101x (collapse) |
 
-**Problem:** RL agent collapsed because separate PPOs per regime couldn't learn cross-regime dynamics.
+**Problem:** Portfolio equity collapsed to -6101x because:
+1. Portfolio update used LGBM-predicted returns (not actual market returns)
+2. Large rebalances triggered massive A&S market impact costs
+3. Equity went negative → catastrophic leverage
 
-#### NEW (Regime-Aware, single PPO on full data with market context features)
+#### AFTER Fix A+D (Actual Returns + Sharpe Reward)
 | Strategy | Sharpe | Ann. Return | Max Drawdown |
 |----------|--------|-------------|--------------|
 | Flat Baseline | -1.86 | -1.12 | -51% |
 | A&S + CVaR | -2.52 | -1.52 | -55% |
-| RL Agent | +5.77 | +17.79 | -4869x |
+| RL Agent | +4.23 | +22.33 | -102x |
 
-**Improvement:** RL Sharpe improved from regime-aware approach (5.77 vs old 7.46 but with better behavior), but max drawdown still catastrophic.
+**Fix A (Actual Returns):** Portfolio update now uses real btc/eth close prices, not LGBM forecasts. Equity reflects actual market performance.
 
-**Analysis:** RL learns extremely aggressive positioning (99%+ in crypto) during bullish regimes, producing extreme returns but catastrophic drawdowns. The drawdown penalty (-0.1 * max(0, drawdown)) is insufficient to prevent this.
+**Fix D (Sharpe Reward):** Reward = Sharpe(50-bar window) + churn_penalty(-0.05) + drawdown_penalty(-0.5). Agent optimizes risk-adjusted returns, not raw returns.
 
-### Regime-Conditional Performance (New RL Agent)
+### Regime-Conditional Performance (After Fix A+D)
 
 | Regime | N | AnnRet | Sharpe | MaxDD |
 |--------|---|--------|--------|-------|
-| Calm | 32,972 | +7.73 | +19.03 | -87% |
-| Volatile | 11,180 | +25.67 | +4.26 | -4368% |
-| Stressed | 467 | +539.73 | +107.47 | 0% |
+| Calm | 32,972 | +8.38 | +7.41 | -81% |
+| Volatile | 11,180 | +46.28 | +4.80 | -354% |
+| Stressed | 467 | +433.51 | +23.30 | -81% |
 
-The RL agent goes extremely levered in volatile/stressed regimes — correct direction (those are the opportunities) but size is uncontrolled.
+The agent still uses leverage (especially in stressed regime) but max DD improved from -6101x to -102x. Volatile regime Max DD=-354% is the remaining concern.
 
 ---
 
@@ -287,8 +290,8 @@ Train a **single PPO** on the full `RegimePortfolioEnv` using all 44,619+ bars. 
 4. **Portfolio constraints**: `np.clip(target_weights, 0.0, 1.0)` to prevent invalid weights
 5. **Validation-based selection**: Early stopping on out-of-sample Sharpe with patience=3
 
-### Remaining Issue: Extreme Leverage
-The agent still learns extremely aggressive positioning (99%+ in crypto) that produces great Sharpe but catastrophic max drawdown (-4869x). The drawdown penalty needs to be stronger, or a maximum weight constraint needs to be added.
+### Remaining Issue: Volatile Regime Leverage
+Max DD in volatile regime is still -354%. The agent learns to take large positions in volatile regimes where the LGBM forecaster identifies mean-reversion opportunities. The Sharpe reward (over 50-bar window) doesn't fully constrain longer-horizon drawdowns.
 
 ---
 
@@ -303,7 +306,8 @@ The agent still learns extremely aggressive positioning (99%+ in crypto) that pr
 7. **Backtest methodology must be consistent** — All strategies on same data, same period, same metrics
 8. **Early stopping on validation Sharpe** — Prevents overfitting, selects best out-of-sample model
 9. **Market context features help** — 30-day trend, volatility percentile give agent more decision information
-10. **Drawdown penalty too weak** — Agent still learns extreme leverage; need stronger penalty or explicit max weight constraint
+10. **Predicted returns ≠ actual equity** — Portfolio update MUST use actual market returns, not forecasts. Forecasts can be wrong, causing equity to diverge from reality and collapse.
+11. **Sharpe reward > raw return reward** — Using Sharpe as reward prevents extreme leverage more effectively than drawdown penalties alone.
 
 ---
 
