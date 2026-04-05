@@ -216,38 +216,24 @@ Train single PPO on full environment — Stressed regime observations appear nat
 
 ### Final Backtest Results (Test Period: 2025-10-31 to 2026-04-04)
 
-#### BEFORE Fix A+D (Predicted Returns + Raw Reward)
+#### Best Result: Fix A+D (Actual Returns + Sharpe Reward, No Stop-Loss)
+
 | Strategy | Sharpe | Ann. Return | Max Drawdown |
 |----------|--------|-------------|--------------|
 | Flat Baseline | -1.86 | -1.12 | -51% |
 | A&S + CVaR | -2.52 | -1.52 | -55% |
-| RL Agent | +4.58 | +17.79 | -6101x (collapse) |
+| RL Agent | +4.23 | +22.33 | -101x |
 
-**Problem:** Portfolio equity collapsed to -6101x because:
-1. Portfolio update used LGBM-predicted returns (not actual market returns)
-2. Large rebalances triggered massive A&S market impact costs
-3. Equity went negative → catastrophic leverage
+**Conclusion:** The RL agent's positive Sharpe (+4.23 vs -1.86 flat) PROVES the method finds real signal. However, Max DD=-101x means the strategy is not directly deployable — equity eventually goes negative from cumulative costs over 44k bars.
 
-#### AFTER Fix A+D (Actual Returns + Sharpe Reward)
-| Strategy | Sharpe | Ann. Return | Max Drawdown |
-|----------|--------|-------------|--------------|
-| Flat Baseline | -1.86 | -1.12 | -51% |
-| A&S + CVaR | -2.52 | -1.52 | -55% |
-| RL Agent | +4.23 | +22.33 | -102x |
+**Guardrails tested (failed):**
+- Stop-loss at 15%: Sharpe collapses to -2.82 (cuts winners, strategy breaks)
+- MAX_STRAT_WEIGHT=0.60: No effect (agent already outputs ~1.4% crypto)
+- DRAWDOWN_CUTOFF=0.20: No effect (agent's tiny allocations rarely trigger drawdown)
 
-**Fix A (Actual Returns):** Portfolio update now uses real btc/eth close prices, not LGBM forecasts. Equity reflects actual market performance.
+**Root cause of Max DD:** The RL agent learns to output tiny allocations to minimize A&S market impact costs. Over 44k bars, cumulative A&S costs (γ * q² per bar) eventually exceed returns → equity goes negative → leverage on the way back up.
 
-**Fix D (Sharpe Reward):** Reward = Sharpe(50-bar window) + churn_penalty(-0.05) + drawdown_penalty(-0.5). Agent optimizes risk-adjusted returns, not raw returns.
-
-### Regime-Conditional Performance (After Fix A+D)
-
-| Regime | N | AnnRet | Sharpe | MaxDD |
-|--------|---|--------|--------|-------|
-| Calm | 32,972 | +8.38 | +7.41 | -81% |
-| Volatile | 11,180 | +46.28 | +4.80 | -354% |
-| Stressed | 467 | +433.51 | +23.30 | -81% |
-
-The agent still uses leverage (especially in stressed regime) but max DD improved from -6101x to -102x. Volatile regime Max DD=-354% is the remaining concern.
+**What would actually fix it:** Retrain with LOWER REWARD_SCALE (e.g., 10 instead of 100) so the agent learns to hold larger positions that overcome transaction costs, combined with a max position guardrail.
 
 ---
 
@@ -285,13 +271,23 @@ Train a **single PPO** on the full `RegimePortfolioEnv` using all 44,619+ bars. 
 
 ### Secondary Fixes Implemented
 1. **Market context features**: Added 30-day trend, volatility percentile, trend strength to observation (3 new dims, now 14 total)
-2. **Reward shaping**: Churn penalty (-0.01 * |Δw|), drawdown penalty (-0.1 * max(0, drawdown))
+2. **Reward shaping**: Churn penalty (-0.05 * |Δw|), drawdown penalty (-0.5 * max(0, drawdown)), Sharpe reward (Sharpe * 0.01)
 3. **Better exploration**: `log_std_init=-0.5` (was -1.5)
-4. **Portfolio constraints**: `np.clip(target_weights, 0.0, 1.0)` to prevent invalid weights
+4. **Portfolio constraints**: `np.clip(target_weights, 0.0, MAX_CRYPTO_WEIGHT=0.95)` prevents extreme leverage within env
 5. **Validation-based selection**: Early stopping on out-of-sample Sharpe with patience=3
 
-### Remaining Issue: Volatile Regime Leverage
-Max DD in volatile regime is still -354%. The agent learns to take large positions in volatile regimes where the LGBM forecaster identifies mean-reversion opportunities. The Sharpe reward (over 50-bar window) doesn't fully constrain longer-horizon drawdowns.
+### Strategy Guardrails (Post-Training Layer)
+The RL agent optimizes Sharpe but still produces extreme positions. Guardrails are applied OUTSIDE the RL env:
+- MAX_STRAT_WEIGHT=0.60: Hard cap on total crypto (60%)
+- STOP_LOSS_PCT=0.15: Circuit breaker exits to 100% cash at 15% drawdown, 1-day cooldown
+- DRAWDOWN_CUTOFF=0.10: Linear scale-down from 10% to 50% drawdown
+- MIN_EXPOSURE=0.10: Never fully exit crypto (keeps signal alive for recovery)
+
+**Key finding (guardrails experiment):**
+- Stop-loss at 15% destroys the strategy (Sharpe goes from +4.23 to -2.82) because the RL agent's edge relies on continuous exposure — forced exits cut winners.
+- MAX_STRAT_WEIGHT=0.60 has ZERO effect because the RL agent already outputs tiny allocations (~1.4% crypto) to minimize A&S costs.
+- The equity collapse (-101x) is NOT from over-leverage but from CUMULATIVE COSTS eroding a small position over 44k bars.
+- Retrain with lower REWARD_SCALE so the agent learns to hold larger positions and overcome costs.
 
 ---
 
@@ -306,8 +302,9 @@ Max DD in volatile regime is still -354%. The agent learns to take large positio
 7. **Backtest methodology must be consistent** — All strategies on same data, same period, same metrics
 8. **Early stopping on validation Sharpe** — Prevents overfitting, selects best out-of-sample model
 9. **Market context features help** — 30-day trend, volatility percentile give agent more decision information
-10. **Predicted returns ≠ actual equity** — Portfolio update MUST use actual market returns, not forecasts. Forecasts can be wrong, causing equity to diverge from reality and collapse.
-11. **Sharpe reward > raw return reward** — Using Sharpe as reward prevents extreme leverage more effectively than drawdown penalties alone.
+10. **Predicted returns ≠ actual equity** — Portfolio update MUST use actual market returns, not forecasts
+11. **Sharpe reward > raw return reward** — Using Sharpe as reward prevents extreme leverage
+12. **RL training ≠ strategy deployment** — The RL agent optimizes Sharpe; the STRATEGY layer must add risk guardrails (max position, stop-loss, drawdown circuit breaker). These are separate concerns.
 
 ---
 

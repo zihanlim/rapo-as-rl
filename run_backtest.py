@@ -235,7 +235,21 @@ def run_as_cvar_strategy(price_data, regime_labels, as_cost_models, alpha=0.05):
     return portfolio_value, portfolio_value.pct_change().fillna(0), pd.Series(turnover_list, index=price_data.index)
 
 def run_rl_strategy(price_data, regime_labels, as_cost_models, rl_policies, lgbm_forecasters):
-    """Regime-aware RL agent using single PPO trained on full environment."""
+    """Regime-aware RL agent with strategy guardrails.
+
+    Guardrails:
+    - MAX_STRAT_WEIGHT: Maximum total crypto (BTC+ETH) weight (prevent over-leverage)
+    - DRAWDOWN_CUTOFF: Start scaling down exposure at this drawdown level
+    - MIN_EXPOSURE: Minimum crypto exposure when in deep drawdown
+
+    Note: No stop-loss — the RL agent's Sharpe relies on continuous exposure.
+    Stop-loss breaks the strategy by cutting winners during temporary dips.
+    """
+    # Strategy risk guardrails
+    MAX_STRAT_WEIGHT = 0.60   # Max 60% in crypto (40% cash minimum)
+    DRAWDOWN_CUTOFF = 0.20    # Start scaling down at 20% drawdown
+    MIN_EXPOSURE = 0.15       # At deep drawdown (50%+), keep at least 15% in crypto
+
     try:
         from src.layer4_rl.rl_env import RegimePortfolioEnv
         env = RegimePortfolioEnv(
@@ -245,24 +259,56 @@ def run_rl_strategy(price_data, regime_labels, as_cost_models, rl_policies, lgbm
             forecasters=lgbm_forecasters,
         )
         obs, _ = env.reset()
-        # Start with actual portfolio value for correct pct_change returns
+
+        # Track equity for drawdown monitoring
         equity_vals = [env.portfolio_value]
         turnover_list = []
         done = truncated = False
         steps_run = 0
 
-        # Use single "full" policy trained on all regimes (regime-aware, not regime-conditional)
+        # Risk state
+        peak_equity = env.portfolio_value
+
+        # Use single "full" policy trained on all regimes
         policy = rl_policies.get('full') or rl_policies.get('Calm')
 
         while not (done or truncated):
+            # Update peak equity and drawdown
+            current_equity = env.portfolio_value
+            if current_equity > peak_equity:
+                peak_equity = current_equity
+            drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0.0
+
+            # Get RL action
             action, _ = policy.predict(obs, deterministic=True)
+
+            # Apply guardrails: cap total crypto weight
+            if drawdown >= DRAWDOWN_CUTOFF:
+                # Drawdown circuit breaker: scale down RL's exposure
+                # Scale from MAX_STRAT_WEIGHT down to MIN_EXPOSURE as drawdown goes from CUTOFF to 50%
+                scale = max(0.0, 1.0 - (drawdown - DRAWDOWN_CUTOFF) / (0.50 - DRAWDOWN_CUTOFF))
+                target_crypto = MAX_STRAT_WEIGHT * scale + MIN_EXPOSURE * (1 - scale)
+                rl_total_crypto = action[0] + action[1]
+                if rl_total_crypto > 1e-6 and target_crypto < rl_total_crypto:
+                    scale_factor = target_crypto / rl_total_crypto
+                    safe_action = action * scale_factor
+                else:
+                    safe_action = action
+            else:
+                # Normal mode: use RL action, but cap at MAX_STRAT_WEIGHT
+                rl_total_crypto = action[0] + action[1]
+                if rl_total_crypto > MAX_STRAT_WEIGHT:
+                    action = action * (MAX_STRAT_WEIGHT / rl_total_crypto)
+                safe_action = action
+
             old_weights = env.current_weights.copy()
-            obs, reward, done, truncated, info = env.step(action)
+            obs, reward, done, truncated, info = env.step(safe_action)
             equity_vals.append(env.portfolio_value)
-            turnover_list.append(np.abs(action - old_weights[:2]).sum())
+            turnover_list.append(np.abs(safe_action - old_weights[:2]).sum())
             steps_run += 1
+
         n = len(price_data)
-        log.info(f"  RL run completed: {steps_run} steps, {len(equity_vals)} equity vals")
+        log.info(f"  RL run completed: {steps_run} steps")
         # Pad to match price_data length
         equity_vals = equity_vals[:n] + [equity_vals[-1]] * max(0, n - len(equity_vals))
         turnover_list = turnover_list[:n] + [turnover_list[-1]] * max(0, n - len(turnover_list))
