@@ -253,6 +253,10 @@ def create_regime_filtered_env(price_data, regime_labels, as_cost_models, foreca
     return env
 
 class RegimePortfolioEnv(gym.Env):
+    # Maximum crypto (BTC+ETH) weight to prevent extreme leverage
+    # 0.95 = max 95% in crypto, min 5% in cash
+    MAX_CRYPTO_WEIGHT = 0.95
+
     """
     Regime-conditional portfolio rebalancing environment.
 
@@ -327,7 +331,7 @@ class RegimePortfolioEnv(gym.Env):
         self.current_weights = np.array([0.5, 0.5, 0.0], dtype=np.float32)
         self.cum_pnl = 0.0
         self.portfolio_value = self.initial_balance
-        self._recent_returns = np.zeros(100)
+        self._recent_rets = np.zeros(100)  # Track actual returns for Sharpe + drawdown
         return self._get_obs(), {}
 
     def _compute_obs_normalization(self, price_data, regime_labels, as_cost_models, forecasters):
@@ -441,8 +445,10 @@ class RegimePortfolioEnv(gym.Env):
         if target_sum > 1.0:
             target = target / target_sum  # Normalize to sum=1
         target_weights = np.append(target, max(0.0, 1.0 - target.sum())).astype(np.float32)
-        # Ensure minimum cash weight of 0
-        target_weights = np.clip(target_weights, 0.0, 1.0)
+        # Clamp crypto weights to MAX_CRYPTO_WEIGHT to prevent extreme leverage
+        # Cash fills the remainder to ensure sum = 1
+        target_weights[:2] = np.clip(target_weights[:2], 0.0, self.MAX_CRYPTO_WEIGHT)
+        target_weights[2] = max(0.0, 1.0 - target_weights[0] - target_weights[1])
         target_weights = target_weights / (target_weights.sum() + 1e-8)
 
         # Get current regime and cost model
@@ -457,13 +463,23 @@ class RegimePortfolioEnv(gym.Env):
         regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
         cost_model = self.as_cost_models.get(regime_str, {})
 
-        # Get LightGBM return forecasts
+        # Get LightGBM return forecasts (for observation/reward signal only)
         mu_btc = self._forecast("BTC", regime_str)
         mu_eth = self._forecast("ETH", regime_str)
         mu = np.array([mu_btc, mu_eth])
 
-        # Portfolio return this period
-        portfolio_return = np.dot(self.current_weights[:2], mu)
+        # FIX A: Use ACTUAL market returns for portfolio update (not forecasted)
+        # This ensures equity curve reflects real market performance, not predictions
+        if self.t > 0:
+            btc_actual = (self.price_data["btc_close"].iloc[self.t] - self.price_data["btc_close"].iloc[self.t - 1]) / self.price_data["btc_close"].iloc[self.t - 1]
+            eth_actual = (self.price_data["eth_close"].iloc[self.t] - self.price_data["eth_close"].iloc[self.t - 1]) / self.price_data["eth_close"].iloc[self.t - 1]
+        else:
+            btc_actual = 0.0
+            eth_actual = 0.0
+        actual_returns = np.array([btc_actual, eth_actual])
+
+        # Portfolio return this period: use actual market returns for equity update
+        portfolio_return = np.dot(self.current_weights[:2], actual_returns)
 
         # A&S execution cost
         delta_weights = target_weights[:2] - self.current_weights[:2]
@@ -475,27 +491,34 @@ class RegimePortfolioEnv(gym.Env):
         cost_eth = self._as_cost(trade_value[1], eth_price, cost_model)
         total_cost = cost_btc + cost_eth
 
-        # Net reward: fractional portfolio return minus fractional cost
-        # Scale rewards to put them in a range PPO handles well (~[-1, 1])
-        REWARD_SCALE = 100.0
+        # FIX D: Sharpe-based reward + risk penalties
+        # Track actual portfolio returns for Sharpe and drawdown calculation
+        if not hasattr(self, '_recent_rets'):
+            self._recent_rets = np.zeros(100)
+        self._recent_rets[:-1] = self._recent_rets[1:]
+        self._recent_rets[-1] = portfolio_return
+
+        # Sharpe reward: risk-adjusted return over recent window
+        sharpe_window = 50
+        recent = self._recent_rets[-sharpe_window:]
+        n = np.sum(recent != 0)  # count non-zero entries
+        if n >= 10:
+            sharpe = (np.mean(recent) / (np.std(recent) + 1e-8)) * np.sqrt(288 * 365)
+        else:
+            sharpe = 0.0
+        sharpe_reward = sharpe * 0.01  # scale Sharpe reward
 
         # Churn penalty: penalize large weight changes
         delta_weights = target_weights[:2] - self.current_weights[:2]
-        churn_penalty = -0.01 * np.abs(delta_weights).sum()
+        churn_penalty = -0.05 * np.abs(delta_weights).sum()
 
         # Drawdown penalty: penalize drawdowns
-        cum = np.cumprod(1 + self._recent_returns) if hasattr(self, '_recent_returns') and len(self._recent_returns) > 0 else np.array([1.0])
+        cum = np.cumprod(1 + self._recent_rets)
         running_max = np.maximum.accumulate(cum)
         current_drawdown = (cum[-1] - running_max[-1]) / (running_max[-1] + 1e-8) if len(cum) > 0 else 0.0
-        drawdown_penalty = -0.1 * max(0, current_drawdown)
+        drawdown_penalty = -0.5 * max(0, current_drawdown)
 
-        # Track recent returns for drawdown calculation
-        if not hasattr(self, '_recent_returns'):
-            self._recent_returns = np.zeros(100)
-        self._recent_returns[:-1] = self._recent_returns[1:]
-        self._recent_returns[-1] = portfolio_return
-
-        reward = (portfolio_return - (total_cost / self.portfolio_value)) * REWARD_SCALE + churn_penalty + drawdown_penalty
+        reward = sharpe_reward + churn_penalty + drawdown_penalty
 
         # Update state — portfolio_value update must be in dollars to stay consistent
         realized_pnl = self.portfolio_value * portfolio_return - total_cost
