@@ -189,14 +189,17 @@ def main():
     log.info('  Loaded LGBM forecasters for BTC/ETH x Calm/Volatile/Stressed')
 
     # -------------------------------------------------------------------------
-    # Create full-data environment for observation normalization
+    # Create training-only environment for observation normalization
+    # FIX CRITICAL-1: Compute normalization from TRAINING split ONLY to avoid
+    # look-ahead bias. The normalization must NOT see validation/test data.
     # -------------------------------------------------------------------------
-    log.info('Computing observation normalization from FULL dataset...')
-    full_env_for_norm = RegimePortfolioEnv(
-        price_df, regime_labels_aligned, as_models, lgbm_models
+    log.info('Computing observation normalization from TRAINING split only...')
+    train_env_for_norm = RegimePortfolioEnv(
+        price_train, regime_train, as_models, lgbm_models
     )
-    obs_norm = (full_env_for_norm._obs_mean, full_env_for_norm._obs_std)
+    obs_norm = (train_env_for_norm._obs_mean, train_env_for_norm._obs_std)
     log.info(f'  obs_std[4:10]: {obs_norm[1][[4,5,6,7,8,9]].round(6)}')
+    log.info(f'  (Using train split only to avoid look-ahead bias)')
 
     # -------------------------------------------------------------------------
     # Create training and validation environments (TRAIN SPLIT ONLY for training)

@@ -310,3 +310,54 @@ The RL agent optimizes Sharpe but still produces extreme positions. Guardrails a
 
 *Document created: 2026-04-05*
 *Project: RAPO-AS-RL (Regime-Aware Portfolio Optimization with Avellaneda-Stoikov Costs via RL)*
+
+---
+
+## 11. Code Review Findings (2026-04-06)
+
+After a rigorous review of the entire codebase (3 subagents, full codebase audit), the following critical issues were identified and fixed.
+
+### FIXED: Weight Clamping Bug (CRITICAL)
+- **File**: `src/layer4_rl/rl_env.py`
+- **Problem**: Cash weight could go negative (leverage) because it was computed before renormalization. The RL agent's intended weights were silently modified.
+- **Fix**: New `_clamp_weights()` method enforces constraints in order: (1) clip crypto to MAX_CRYPTO_WEIGHT, (2) scale if total crypto exceeds limit, (3) cash = 1 - total crypto. Cash is guaranteed ≥ 5%.
+
+### FIXED: Churn Penalty Misaligned (CRITICAL)
+- **File**: `src/layer4_rl/rl_env.py`
+- **Problem**: Churn penalty was computed on the original `action` but the environment's `_clamp_weights()` modifies it. The agent was penalized for intended trades, not executed trades.
+- **Fix**: Churn penalty now uses `executed_delta = target_weights[:2] - current_weights[:2]` where `target_weights` is the post-clamping result.
+
+### FIXED: Normalization Look-Ahead Bias (CRITICAL)
+- **File**: `train_rl_stable.py`
+- **Problem**: Observation normalization (`_obs_mean`, `_obs_std`) was computed on the FULL dataset (train+val+test). This is look-ahead bias — future data influenced normalization statistics seen during training.
+- **Fix**: Normalization now computed from TRAINING SPLIT ONLY. Validation and test data are completely held out.
+
+### KNOWN ISSUES (Not Yet Fixed)
+
+#### A&S Cost Dimensional Analysis (HIGH)
+The Avellaneda-Stoikov cost formula may have unit inconsistencies. The spread is calibrated in dollars but the cost formula may expect fractional prices. This should be verified before any deployment.
+
+#### Stressed Regime No Real Forecaster (HIGH)
+Stressed regime has no trained LightGBM model — uses `SyntheticForecaster` with negative mean. The agent is trained with a forecaster that predicts losses in crisis periods.
+
+#### LGBM R² Near Zero (HIGH)
+All LightGBM validation R² values are near 0 or negative. The forecasters have no predictive power. The regime-conditional return forecasts add noise, not signal.
+
+#### Stressed Regime = 20 Observations (HIGH)
+Only 0.23% of data is in Stressed regime. The HMM cannot reliably detect crisis conditions. This is a fundamental data limitation.
+
+#### BIC Prefers 4 States, Used 3 (MEDIUM)
+BIC selects 4 states (BIC=-129,944) over 3 states (BIC=-125,912). The project manually overrides to 3. A 4-state model may better capture market regimes.
+
+#### No Bootstrap Seed (MEDIUM)
+Bootstrap CI uses random sampling without `np.random.seed()`. Results are non-reproducible.
+
+#### No Multiple Testing Correction (MEDIUM)
+3 pairwise statistical tests performed without correction. Family-wise error rate is inflated.
+
+### Code Review Tracking Document
+All issues are tracked in `CODE_REVIEW_ISSUES.md` with priority, status, and fix notes.
+
+---
+
+*Last updated: 2026-04-06*

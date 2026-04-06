@@ -437,19 +437,28 @@ class RegimePortfolioEnv(gym.Env):
         self._obs_count = len(samples)
 
 
+    def _clamp_weights(self, w: np.ndarray) -> np.ndarray:
+        """Safely clamp weights to valid simplex with MAX_CRYPTO_WEIGHT constraint.
+
+        Rules:
+        1. Each crypto weight ∈ [0, MAX_CRYPTO_WEIGHT]
+        2. Total crypto ≤ MAX_CRYPTO_WEIGHT (so cash ≥ 1 - MAX_CRYPTO_WEIGHT)
+        3. Sum to 1.0
+        """
+        crypto = np.clip(w[:2], 0.0, self.MAX_CRYPTO_WEIGHT)
+        total_crypto = crypto.sum()
+        if total_crypto > self.MAX_CRYPTO_WEIGHT:
+            # Scale down proportionally to respect max crypto
+            crypto = crypto * (self.MAX_CRYPTO_WEIGHT / total_crypto)
+        cash = 1.0 - crypto.sum()
+        return np.array([crypto[0], crypto[1], max(0.0, cash)], dtype=np.float32)
+
     def step(self, action: np.ndarray):
         """Execute one 5-min trading period."""
-        # Normalize action to valid weight simplex
-        target = np.clip(action, 0.0, 1.0)
-        target_sum = target.sum()
-        if target_sum > 1.0:
-            target = target / target_sum  # Normalize to sum=1
-        target_weights = np.append(target, max(0.0, 1.0 - target.sum())).astype(np.float32)
-        # Clamp crypto weights to MAX_CRYPTO_WEIGHT to prevent extreme leverage
-        # Cash fills the remainder to ensure sum = 1
-        target_weights[:2] = np.clip(target_weights[:2], 0.0, self.MAX_CRYPTO_WEIGHT)
-        target_weights[2] = max(0.0, 1.0 - target_weights[0] - target_weights[1])
-        target_weights = target_weights / (target_weights.sum() + 1e-8)
+        # Clamp to valid weight simplex with crypto cap
+        target_weights = self._clamp_weights(action)
+        # Track executed delta for cost and churn computation
+        executed_delta = target_weights[:2] - self.current_weights[:2]
 
         # Get current regime and cost model
         # Handle both integer index (filtered env) and datetime index (full env)
@@ -481,9 +490,8 @@ class RegimePortfolioEnv(gym.Env):
         # Portfolio return this period: use actual market returns for equity update
         portfolio_return = np.dot(self.current_weights[:2], actual_returns)
 
-        # A&S execution cost
-        delta_weights = target_weights[:2] - self.current_weights[:2]
-        trade_value = np.abs(delta_weights) * self.portfolio_value
+        # A&S execution cost — use executed_delta (post-clamping)
+        trade_value = np.abs(executed_delta) * self.portfolio_value
         btc_price = self.price_data["btc_close"].iloc[self.t]
         eth_price = self.price_data["eth_close"].iloc[self.t]
 
@@ -508,9 +516,8 @@ class RegimePortfolioEnv(gym.Env):
             sharpe = 0.0
         sharpe_reward = sharpe * 0.01  # was 0.05
 
-        # Churn penalty: penalize large weight changes
-        delta_weights = target_weights[:2] - self.current_weights[:2]
-        churn_penalty = -0.05 * np.abs(delta_weights).sum()
+        # Churn penalty: penalize large weight changes using EXECUTED delta
+        churn_penalty = -0.05 * np.abs(executed_delta).sum()
 
         # Drawdown penalty: penalize drawdowns
         cum = np.cumprod(1 + self._recent_rets)
@@ -520,12 +527,10 @@ class RegimePortfolioEnv(gym.Env):
 
         reward = sharpe_reward + churn_penalty + drawdown_penalty
 
-        # Update state — portfolio_value update must be in dollars to stay consistent
+        # Update state — use already-clamped target_weights
         realized_pnl = self.portfolio_value * portfolio_return - total_cost
         self.cum_pnl += realized_pnl
-        # target_weights is [btc, eth]; cash fills the remainder to sum to 1
-        cash_w = 1.0 - target_weights[0] - target_weights[1]
-        self.current_weights = np.array([target_weights[0], target_weights[1], cash_w], dtype=np.float32)
+        self.current_weights = target_weights  # Already properly clamped by _clamp_weights()
         self.portfolio_value += realized_pnl
         self.t += 1
         self._elapsed_steps += 1
