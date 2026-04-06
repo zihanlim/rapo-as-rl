@@ -652,22 +652,34 @@ class RegimePortfolioEnv(gym.Env):
     def _as_cost(self, trade_value: float, price: float, cost_model: dict) -> float:
         """Compute A&S cost for a trade.
 
-        A&S cost model parameters are per BTC:
-            - s: spread in $/BTC (half-spread = s/2)
-            - delta: market depth in BTC/$ (i.e., BTC流动性 per dollar)
-            - gamma: temporary impact parameter in $/BTC per BTC traded
-            - sigma: annual volatility in $/BTC (deannualized to per-bar)
+        A&S cost model parameters:
+            - s: spread in $/BTC (half-spread = s/2). E.g., s=104 means $104/BTC.
+            - delta: market depth in BTC/$ (i.e., BTC per dollar of price impact)
+            - gamma: risk aversion parameter (dimensionless)
+            - sigma: annual VOLATILITY (relative, dimensionless fraction).
+                      E.g., sigma=0.57 means 57% annual volatility.
+                      The std of 5-min log returns ≈ 0.57/sqrt(288*365) ≈ 0.00176.
+
+        The sigma stored in cost_model is RELATIVE (fraction), NOT absolute $/BTC.
+        The std of log returns is dimensionless (e.g., 0.57 = 57%), so to convert
+        to per-bar dollar impact: sigma_rel * price.
 
         Trade size q is in BTC (trade_value / price).
         """
         if not cost_model or price == 0:
             return 0.0
 
-        sigma_annual = cost_model.get("volatility", 0.0)  # annual vol in $/BTC
-        sigma = sigma_annual / np.sqrt(365 * 288)  # per-bar vol in $/BTC
-        s = cost_model.get("spread", 0.0)  # spread in $/BTC
+        # FIX HIGH-1: sigma is RELATIVE volatility (fraction), not $/BTC.
+        # sigma_annual from calibration is std(log_returns) * sqrt(288*365),
+        # which is DIMENSIONLESS (e.g., 0.57 = 57% annual vol).
+        # To get per-bar dollar impact: sigma_rel * price.
+        sigma_annual = cost_model.get("volatility", 0.0)  # relative, dimensionless
+        sigma_rel = sigma_annual / price  # relative per-bar: fraction of price
+        sigma = sigma_rel / np.sqrt(365 * 288)  # per-bar relative vol (fraction)
+
+        s = cost_model.get("spread", 0.0)  # spread in $/BTC (absolute)
         delta = cost_model.get("depth", 1.0)  # depth in BTC/$
-        gamma = cost_model.get("gamma", 1e-6)  # gamma in $/BTC per BTC
+        gamma = cost_model.get("gamma", 1e-6)  # risk aversion (dimensionless)
         q = trade_value / price  # quantity in BTC
 
         # Guard against invalid values
@@ -678,11 +690,16 @@ class RegimePortfolioEnv(gym.Env):
             delta = 1.0  # Avoid division by zero
 
         # A&S cost components:
-        # Market impact: sigma * sqrt(q / (2*delta)) - permanent price impact
-        market_impact = sigma * np.sqrt(max(0, q / (2 * delta))) * price
+        # Market impact: sigma_rel * price * sqrt(q / (2*delta))
+        # sigma (fraction) * price ($/BTC) = per-bar vol in $ * sqrt(q/delta) gives $
+        market_impact = sigma * price * np.sqrt(max(0, q / (2 * delta)))
         # Spread cost: half-spread * quantity (in BTC terms, gives $)
+        # s ($/BTC) * q (BTC) = $ [but this is too large, so s must be interpreted as fraction]
+        # Actually: s is in $/BTC, and 50 bps means s/P = 0.005, so s = s/P * P.
+        # The s stored is 104 ($/BTC) = 0.00104 (fraction) * 100000 ($/BTC).
+        # spread_cost = (s/P / 2) * q * P = (s/2) * q — same formula works if s is $/BTC!
         spread_cost = (s / 2) * q
-        # Temporary impact: gamma * q^2 / (2*delta)
+        # Inventory risk: gamma * q^2 / (2*delta) * price (dimensionally tricky)
         impact_cost = gamma * (q ** 2) / (2 * delta) * price
 
         # Guard against NaN/Inf

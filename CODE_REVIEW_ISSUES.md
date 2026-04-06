@@ -157,9 +157,9 @@ Issues are prioritized by severity and must be resolved before any deployment.
 | CRITICAL-4 | **FIXED** | rl_env.py | Churn penalty now uses executed_delta |
 | CRITICAL-5 | **FIXED** | rl_env.py | Cash weight computed safely via _clamp_weights() |
 | CRITICAL-6 | ACKNOWLEDGED | train_rl_stable.py | Val Sharpe=28.45 is high but within bounds for noisy RL env |
-| HIGH-1 | TODO | as_calibrate.py, rl_env.py | Verify A&S cost dimensional analysis |
+| HIGH-1 | **FIXED** | rl_env.py | sigma is RELATIVE vol (fraction), not absolute \$/BTC. Original formula was 100,000x too large. Fix: sigma_rel = sigma_annual/price, then mi = sigma_rel * price * sqrt(q/(2*delta)). |
 | HIGH-2 | TODO | rl_env.py | Train stressed LGBM or use blend |
-| HIGH-3 | TODO | notebook | Add guardrails to notebook RL |
+| HIGH-3 | **FIXED** | notebook | Added guardrails (MAX_STRAT_WEIGHT=0.60, DRAWDOWN_CUTOFF=0.20, MIN_EXPOSURE=0.15) + fixed equity_vals to use actual portfolio_value + turnover uses safe_action |
 | HIGH-4 | VERIFIED OK | rl_env.py | LGBM features use array order, names don't matter for prediction |
 | HIGH-5 | **FIXED** | notebook | Now uses ppo_full.zip |
 | MEDIUM-1 | TODO | rl_env.py | Adjust reward scaling |

@@ -332,10 +332,21 @@ After a rigorous review of the entire codebase (3 subagents, full codebase audit
 - **Problem**: Observation normalization (`_obs_mean`, `_obs_std`) was computed on the FULL dataset (train+val+test). This is look-ahead bias — future data influenced normalization statistics seen during training.
 - **Fix**: Normalization now computed from TRAINING SPLIT ONLY. Validation and test data are completely held out.
 
-### KNOWN ISSUES (Not Yet Fixed)
+### FIXED: A&S Cost Sigma Dimensional Analysis (HIGH)
+- **File**: `src/layer4_rl/rl_env.py` (`_as_cost` method)
+- **Problem**: The `sigma` from the cost model was being used as ABSOLUTE volatility in $/BTC, but it's actually RELATIVE volatility (a dimensionless fraction). The calibration computes `std(log_returns) * sqrt(288*365)` which is dimensionless (e.g., 0.57 = 57% annual vol). The formula was treating this as 0.57 $/BTC per sqrt-year, resulting in market impact estimates **100,000x too large**.
+- **Fix**: Convert sigma to relative: `sigma_rel = sigma_annual / price`, then per-bar: `sigma = sigma_rel / sqrt(288*365)`. Market impact: `mi = sigma * price * sqrt(q/(2*delta))`. This gives realistic costs:
+  - Calm: 5.25 bps (spread dominant)
+  - Volatile: 13.37 bps
+  - Stressed: 36.68 bps (~7x calm, within expected 5-10x range)
+- **Note**: The `spread` ($/BTC) and `delta` (BTC/$) parameters are correctly calibrated. Only `sigma` needed fixing.
 
-#### A&S Cost Dimensional Analysis (HIGH)
-The Avellaneda-Stoikov cost formula may have unit inconsistencies. The spread is calibrated in dollars but the cost formula may expect fractional prices. This should be verified before any deployment.
+### FIXED: Notebook RL Strategy Lacked Guardrails (HIGH)
+- **File**: `notebooks/05_backtest_analysis.ipynb` (`run_rl_strategy`)
+- **Problem**: The notebook's RL strategy had: (1) no guardrails (MAX_STRAT_WEIGHT, DRAWDOWN_CUTOFF, MIN_EXPOSURE), (2) `equity_vals = [1.0]` normalized instead of actual portfolio_value, (3) turnover computed from raw `action` instead of post-guardrail `safe_action`. The RL was outputting near-cash allocations matching the flat baseline exactly (confirmed by t-test t=0.000).
+- **Fix**: Added guardrails matching run_backtest.py: MAX_STRAT_WEIGHT=0.60, DRAWDOWN_CUTOFF=0.20, MIN_EXPOSURE=0.15. Changed equity_vals to use actual `env.portfolio_value`. Turnover now uses `safe_action`.
+
+### KNOWN ISSUES (Not Yet Fixed)
 
 #### Stressed Regime No Real Forecaster (HIGH)
 Stressed regime has no trained LightGBM model — uses `SyntheticForecaster` with negative mean. The agent is trained with a forecaster that predicts losses in crisis periods.
