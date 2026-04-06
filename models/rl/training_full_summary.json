@@ -1,0 +1,27 @@
+{
+  "total_steps": 35000,
+  "best_val_sharpe": 28.445468509611384,
+  "final_eval_count": 14,
+  "train_split": {
+    "start": "2025-10-06",
+    "end": "2025-10-26",
+    "n_bars": 5761
+  },
+  "val_split": {
+    "start": "2025-10-26",
+    "end": "2025-10-31",
+    "n_bars": 1440
+  },
+  "hyperparameters": {
+    "net_arch": [
+      32,
+      32
+    ],
+    "lr": 3e-05,
+    "clip": 0.1,
+    "n_steps": 64,
+    "batch_size": 16,
+    "mgn": 0.5,
+    "log_std": -0.5
+  }
+}

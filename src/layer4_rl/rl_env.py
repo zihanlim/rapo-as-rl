@@ -499,14 +499,14 @@ class RegimePortfolioEnv(gym.Env):
         self._recent_rets[-1] = portfolio_return
 
         # Sharpe reward: risk-adjusted return over recent window
-        sharpe_window = 50
+        sharpe_window = 50  # was 200
         recent = self._recent_rets[-sharpe_window:]
         n = np.sum(recent != 0)  # count non-zero entries
         if n >= 10:
             sharpe = (np.mean(recent) / (np.std(recent) + 1e-8)) * np.sqrt(288 * 365)
         else:
             sharpe = 0.0
-        sharpe_reward = sharpe * 0.01  # scale Sharpe reward
+        sharpe_reward = sharpe * 0.01  # was 0.05
 
         # Churn penalty: penalize large weight changes
         delta_weights = target_weights[:2] - self.current_weights[:2]
