@@ -1,16 +1,14 @@
 {
-  "total_steps": 35000,
-  "best_val_sharpe": 28.445468509611384,
-  "final_eval_count": 14,
+  "total_steps": 100000,
   "train_split": {
-    "start": "2025-10-06",
-    "end": "2025-10-26",
-    "n_bars": 5761
+    "start": "2017-08-17",
+    "end": "2024-02-10",
+    "n_bars": 682105
   },
-  "val_split": {
-    "start": "2025-10-26",
-    "end": "2025-10-31",
-    "n_bars": 1440
+  "test_split": {
+    "start": "2024-02-10",
+    "end": "2026-04-10",
+    "n_bars": 227368
   },
   "hyperparameters": {
     "net_arch": [
@@ -23,5 +21,6 @@
     "batch_size": 16,
     "mgn": 0.5,
     "log_std": -0.5
-  }
+  },
+  "note": "No validation \u2014 train until max steps. Test evaluation via run_backtest.py"
 }
