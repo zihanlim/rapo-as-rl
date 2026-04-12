@@ -75,3 +75,7 @@ notebooks/models/
 notebooks/checkpoints/
 
 # Processed data
+
+# Large data files (>100MB, use git lfs or external storage)
+data/processed/price_features.parquet
+data/processed/trades_processed.parquet
