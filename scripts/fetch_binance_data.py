@@ -411,9 +411,9 @@ def fetch_all_data(symbols: list, start_date: str, end_date: datetime, use_synth
     all_data = {}
     real_ohlcv_available = False
 
-    # Fetch 180 days from API (no synthetic fallback - get real market data)
-    # This gives ~52,000 5-min bars per symbol, enough for meaningful backtesting
-    api_fetch_days = 180
+    # Fetch data from API (no synthetic fallback - get real market data)
+    # 10 years = ~3650 days gives ~1M bars for full market cycles (2016-2026)
+    api_fetch_days = 3650
     synthetic_start = end_date - timedelta(days=api_fetch_days)
     log.info(f"Fetching {api_fetch_days} days of OHLCV from API ({synthetic_start} to {end_date})")
 

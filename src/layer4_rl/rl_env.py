@@ -253,9 +253,10 @@ def create_regime_filtered_env(price_data, regime_labels, as_cost_models, foreca
     return env
 
 class RegimePortfolioEnv(gym.Env):
-    # Maximum crypto (BTC+ETH) weight to prevent extreme leverage
-    # 0.95 = max 95% in crypto, min 5% in cash
-    MAX_CRYPTO_WEIGHT = 0.95
+    # Strategy risk guardrails (moved from run_backtest.py for consistent training/inference)
+    MAX_STRAT_WEIGHT = 0.85   # Was 0.60 — allow higher crypto exposure
+    MIN_EXPOSURE = 0.30        # Was 0.15 — stay more invested in bull markets
+    DRAWDOWN_CUTOFF = 0.20    # Keep same
 
     """
     Regime-conditional portfolio rebalancing environment.
@@ -284,6 +285,9 @@ class RegimePortfolioEnv(gym.Env):
         as_cost_models,
         forecasters,
         initial_balance: float = 100_0,
+        obs_mean: Optional[np.ndarray] = None,
+        obs_std: Optional[np.ndarray] = None,
+        decision_interval: int = 1,
     ):
         super().__init__()
 
@@ -293,6 +297,12 @@ class RegimePortfolioEnv(gym.Env):
         self.forecasters = forecasters
         self.initial_balance = initial_balance
 
+        # decision_interval: RL makes decisions every N bars.
+        # 1 = every bar (5-min), 288 = daily, 2016 = weekly.
+        # On intermediate (hold) steps, the previous target_weights is reused,
+        # so executed_delta=0 and NO A&S cost is incurred.
+        self.decision_interval = decision_interval
+
         self.n_assets = 2  # BTC, ETH
         self.t = 0
         self.max_t = len(self.price_data) - 2
@@ -301,10 +311,38 @@ class RegimePortfolioEnv(gym.Env):
         self._max_episode_steps = self.max_t + 1
         self._elapsed_steps = 0
 
+        # Persistent target_weights across hold steps (set in first step or decision step)
+        self._target_weights = None
+
+        # HIGH-2 fix: Compute calm mean vol for stressed threshold override
+        # HMM stressed regime = data outliers (957 bars, ~2%)
+        # Volatility threshold approach gives more robust stressed detection
+        # Threshold: 3x calm mean realized_vol
+        if "realized_vol" in price_data.columns and len(price_data) > 0:
+            calm_mask = regime_labels == "Calm"
+            if calm_mask.sum() > 0:
+                # Get numpy values directly, then apply boolean mask to both arrays
+                realized_vols = price_data["realized_vol"].values
+                calm_vols = realized_vols[calm_mask.values]
+                self._calm_mean_vol = calm_vols.mean()
+            else:
+                self._calm_mean_vol = price_data["realized_vol"].mean() * 0.5
+            self._stressed_vol_threshold = 3.0 * self._calm_mean_vol
+        else:
+            self._calm_mean_vol = 0.001
+            self._stressed_vol_threshold = 0.003
+
+        # CRITICAL-3 fix: If obs_mean/obs_std provided (from train split), use them directly.
+        # This prevents train/test normalization mismatch that corrupts RL observations.
+        if obs_mean is not None and obs_std is not None:
+            self._obs_mean = obs_mean
+            self._obs_std = obs_std
+        else:
+            # Backwards compatible: compute from provided price_data
+            self._compute_obs_normalization(price_data, regime_labels, as_cost_models, forecasters)
+
         # PPO is sensitive to observation scales. Compute normalization stats
         # from all data upfront so training and backtest use the SAME stats.
-        self._compute_obs_normalization(price_data, regime_labels, as_cost_models, forecasters)
-
         # Observation space: 14 dimensions
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
@@ -332,6 +370,11 @@ class RegimePortfolioEnv(gym.Env):
         self.cum_pnl = 0.0
         self.portfolio_value = self.initial_balance
         self._recent_rets = np.zeros(100)  # Track actual returns for Sharpe + drawdown
+        # CRITICAL-4 fix: Track peak equity and drawdown for internal guardrails
+        self._peak_equity = self.initial_balance
+        self._current_drawdown = 0.0
+        # Persistent target_weights across hold steps (reset on new episode)
+        self._target_weights = None
         return self._get_obs(), {}
 
     def _compute_obs_normalization(self, price_data, regime_labels, as_cost_models, forecasters):
@@ -385,6 +428,11 @@ class RegimePortfolioEnv(gym.Env):
             else:
                 ts = price_data.index[t_idx]
                 regime_str = regime_labels.get(ts, "Calm")
+            # HIGH-2 fix: Apply same threshold override for consistency
+            if "realized_vol" in price_data.columns:
+                current_vol = price_data["realized_vol"].iloc[t_idx]
+                if current_vol > self._stressed_vol_threshold:
+                    regime_str = "Stressed"
             regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
             cost_model = as_cost_models.get(regime_str, {})
             # Use actual historical return as mu proxy so that obs_std reflects
@@ -432,33 +480,72 @@ class RegimePortfolioEnv(gym.Env):
         # normalized values within ~[-100, 100] before clipping to [-10, 10]
         MIN_STD = 1e-5
         for i in [4, 5, 6, 7, 8]:
-            if self._obs_std[i] < MIN_STD:
+            # Guard against NaN (e.g., from NaN mu values at start of data)
+            if self._obs_std[i] < MIN_STD or np.isnan(self._obs_std[i]):
                 self._obs_std[i] = MIN_STD
         self._obs_count = len(samples)
 
 
     def _clamp_weights(self, w: np.ndarray) -> np.ndarray:
-        """Safely clamp weights to valid simplex with MAX_CRYPTO_WEIGHT constraint.
+        """Safely clamp weights to valid simplex with MAX_STRAT_WEIGHT constraint.
 
         Rules:
-        1. Each crypto weight ∈ [0, MAX_CRYPTO_WEIGHT]
-        2. Total crypto ≤ MAX_CRYPTO_WEIGHT (so cash ≥ 1 - MAX_CRYPTO_WEIGHT)
+        1. Each crypto weight ∈ [0, MAX_STRAT_WEIGHT]
+        2. Total crypto ≤ MAX_STRAT_WEIGHT (so cash ≥ 1 - MAX_STRAT_WEIGHT)
         3. Sum to 1.0
         """
-        crypto = np.clip(w[:2], 0.0, self.MAX_CRYPTO_WEIGHT)
+        crypto = np.clip(w[:2], 0.0, self.MAX_STRAT_WEIGHT)
         total_crypto = crypto.sum()
-        if total_crypto > self.MAX_CRYPTO_WEIGHT:
+        if total_crypto > self.MAX_STRAT_WEIGHT:
             # Scale down proportionally to respect max crypto
-            crypto = crypto * (self.MAX_CRYPTO_WEIGHT / total_crypto)
+            crypto = crypto * (self.MAX_STRAT_WEIGHT / total_crypto)
         cash = 1.0 - crypto.sum()
         return np.array([crypto[0], crypto[1], max(0.0, cash)], dtype=np.float32)
 
     def step(self, action: np.ndarray):
-        """Execute one 5-min trading period."""
-        # Clamp to valid weight simplex with crypto cap
-        target_weights = self._clamp_weights(action)
-        # Track executed delta for cost and churn computation
-        executed_delta = target_weights[:2] - self.current_weights[:2]
+        """Execute one 5-min trading period.
+
+        When decision_interval > 1, the RL action is only applied every N bars.
+        On intermediate (hold) steps, the previous target_weights is reused,
+        so executed_delta=0 and NO A&S cost is incurred — only portfolio return
+        accrues. This changes the fundamental unit of RL decision-making from
+        every bar to every decision_interval bars.
+        """
+        is_decision_step = (self.t % self.decision_interval == 0)
+
+        if is_decision_step:
+            # Apply new action: clamp to valid simplex
+            new_target = self._clamp_weights(action)
+            if self._target_weights is None:
+                self._target_weights = new_target.copy()
+            else:
+                self._target_weights = new_target.copy()
+
+            # CRITICAL-4 fix: Apply drawdown scaling INSIDE env (moved from run_backtest.py)
+            # This ensures consistent guardrail behavior during training and inference.
+            # Update peak equity and drawdown
+            if self.portfolio_value > self._peak_equity:
+                self._peak_equity = self.portfolio_value
+            if self._peak_equity > 0:
+                self._current_drawdown = (self._peak_equity - self.portfolio_value) / self._peak_equity
+            # Apply drawdown scaling: reduce exposure as drawdown goes from CUTOFF to 50%
+            if self._current_drawdown >= self.DRAWDOWN_CUTOFF:
+                scale = max(0.0, 1.0 - (self._current_drawdown - self.DRAWDOWN_CUTOFF) / (0.50 - self.DRAWDOWN_CUTOFF))
+                target_crypto = self.MAX_STRAT_WEIGHT * scale + self.MIN_EXPOSURE * (1 - scale)
+                total_crypto = self._target_weights[0] + self._target_weights[1]
+                if total_crypto > 1e-6 and target_crypto < total_crypto:
+                    scale_factor = target_crypto / total_crypto
+                    self._target_weights = self._target_weights * np.array([scale_factor, scale_factor, 1.0])
+                    self._target_weights[2] = max(0.0, 1.0 - self._target_weights[0] - self._target_weights[1])
+        else:
+            # Hold step: reuse previous target_weights — no executed delta, no cost
+            # _target_weights was already set at the last decision step
+            pass
+
+        # executed_delta is computed from current_weights (where we ARE) to target_weights (where we WANT to be)
+        # On decision steps: this is the new trade
+        # On hold steps: _target_weights == current_weights, so executed_delta == 0
+        executed_delta = self._target_weights[:2] - self.current_weights[:2]
 
         # Get current regime and cost model
         # Handle both integer index (filtered env) and datetime index (full env)
@@ -469,6 +556,15 @@ class RegimePortfolioEnv(gym.Env):
             # Datetime-indexed (full env): look up by timestamp
             ts = self.price_data.index[self.t]
             regime_str = self.regime_labels.get(ts, "Calm")
+
+        # HIGH-2 fix: Override to Stressed if realized_vol exceeds threshold
+        # HMM stressed regime is fragmented (957 bars, ~2%) — data outliers
+        # Volatility threshold gives more robust stressed detection
+        if "realized_vol" in self.price_data.columns:
+            current_vol = self.price_data["realized_vol"].iloc[self.t]
+            if current_vol > self._stressed_vol_threshold:
+                regime_str = "Stressed"
+
         regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
         cost_model = self.as_cost_models.get(regime_str, {})
 
@@ -490,7 +586,8 @@ class RegimePortfolioEnv(gym.Env):
         # Portfolio return this period: use actual market returns for equity update
         portfolio_return = np.dot(self.current_weights[:2], actual_returns)
 
-        # A&S execution cost — use executed_delta (post-clamping)
+        # A&S execution cost — only non-zero when executed_delta > 0 (i.e., on decision steps
+        # when the action differs from current_weights, or on hold steps when action repeats)
         trade_value = np.abs(executed_delta) * self.portfolio_value
         btc_price = self.price_data["btc_close"].iloc[self.t]
         eth_price = self.price_data["eth_close"].iloc[self.t]
@@ -499,25 +596,33 @@ class RegimePortfolioEnv(gym.Env):
         cost_eth = self._as_cost(trade_value[1], eth_price, cost_model)
         total_cost = cost_btc + cost_eth
 
-        # FIX D: Sharpe-based reward + risk penalties
-        # Track actual portfolio returns for Sharpe and drawdown calculation
+        # FIX D (revised): Return-based reward aligned with backtest objective
+        # CRITICAL-3 fix: RL optimizes Sharpe but backtest evaluates TOTAL RETURN.
+        # Changed to portfolio_return to align RL objective with backtest metric.
+        # Churn and drawdown penalties still provide risk control.
+        #
+        # Track returns for drawdown calculation only (Sharpe reward removed)
         if not hasattr(self, '_recent_rets'):
             self._recent_rets = np.zeros(100)
         self._recent_rets[:-1] = self._recent_rets[1:]
         self._recent_rets[-1] = portfolio_return
 
-        # Sharpe reward: risk-adjusted return over recent window
-        sharpe_window = 50  # was 200
-        recent = self._recent_rets[-sharpe_window:]
-        n = np.sum(recent != 0)  # count non-zero entries
-        if n >= 10:
-            sharpe = (np.mean(recent) / (np.std(recent) + 1e-8)) * np.sqrt(288 * 365)
-        else:
-            sharpe = 0.0
-        sharpe_reward = sharpe * 0.01  # was 0.05
+        # RL REWARD = beat-benchmark (not absolute return)
+        benchmark_return = 0.6 * btc_actual + 0.4 * eth_actual
+        return_reward = portfolio_return - benchmark_return
+
+        # OPPORTUNITY COST PENALTY: penalize foregone gains when underinvested during rising markets
+        total_crypto = self.current_weights[0] + self.current_weights[1]
+        if portfolio_return > 0 and total_crypto < 0.30:
+            return_reward -= 0.3 * portfolio_return
 
         # Churn penalty: penalize large weight changes using EXECUTED delta
-        churn_penalty = -0.05 * np.abs(executed_delta).sum()
+        # CRITICAL: Reduced from -0.05 to -0.005 (10x less aggressive).
+        # Original -0.05 made any rebalance costlier than typical 5-min returns,
+        # driving the agent to avoid all trading. With -0.005, rebalancing is
+        # penalized proportionally to the A&S cost of the trade.
+        # On hold steps, executed_delta == 0 so churn_penalty == 0.
+        churn_penalty = -0.005 * np.abs(executed_delta).sum()
 
         # Drawdown penalty: penalize drawdowns
         cum = np.cumprod(1 + self._recent_rets)
@@ -525,12 +630,12 @@ class RegimePortfolioEnv(gym.Env):
         current_drawdown = (cum[-1] - running_max[-1]) / (running_max[-1] + 1e-8) if len(cum) > 0 else 0.0
         drawdown_penalty = -0.5 * max(0, current_drawdown)
 
-        reward = sharpe_reward + churn_penalty + drawdown_penalty
+        reward = return_reward + churn_penalty + drawdown_penalty
 
-        # Update state — use already-clamped target_weights
+        # Update state — current_weights moves to target_weights (same on hold steps = no trade)
         realized_pnl = self.portfolio_value * portfolio_return - total_cost
         self.cum_pnl += realized_pnl
-        self.current_weights = target_weights  # Already properly clamped by _clamp_weights()
+        self.current_weights = self._target_weights.copy()  # Already properly clamped
         self.portfolio_value += realized_pnl
         self.t += 1
         self._elapsed_steps += 1
@@ -556,6 +661,13 @@ class RegimePortfolioEnv(gym.Env):
             # Datetime-indexed (full env): look up by timestamp
             ts = self.price_data.index[t_idx]
             regime_str = self.regime_labels.get(ts, "Calm")
+
+        # HIGH-2 fix: Override to Stressed if realized_vol exceeds threshold
+        if "realized_vol" in self.price_data.columns:
+            current_vol = self.price_data["realized_vol"].iloc[t_idx]
+            if current_vol > self._stressed_vol_threshold:
+                regime_str = "Stressed"
+
         regime_idx = {"Calm": 0, "Volatile": 1, "Stressed": 2}.get(regime_str, 0)
         cost_model = self.as_cost_models.get(regime_str, {})
 
@@ -606,42 +718,26 @@ class RegimePortfolioEnv(gym.Env):
         return norm_obs
 
     def _forecast(self, asset: str, regime: str) -> float:
-        """Get LightGBM forecast for asset/regime. Returns 0.0 if model unavailable."""
+        """Get return forecast for asset/regime.
+
+        CRITICAL-2 fix: LGBM R² ≈ 0 for all regimes (no predictive power).
+        Replaced LGBM with actual lagged return — real signal, not noise.
+        The lagged return provides momentum information which is more robust
+        than noisy model predictions at 5-min frequency.
+        """
         try:
-            model = self.forecasters.get(asset, {}).get(regime)
-            if model is None:
-                return 0.0
-            # Build features for this timestamp (EXACTLY matching lgbm_train.py feature_cols)
             t_idx = min(self.t, len(self.price_data) - 1)
             row = self.price_data.iloc[t_idx]
             asset_prefix = asset.lower()
-            # Feature names must EXACTLY match what LGBM was trained with
-            feature_names = [
-                "return_lag_1", "return_lag_3", "return_lag_6",
-                "realized_vol", "spread_proxy", "ofi", "cross_asset_return",
-                "regime_Calm", "regime_Volatile", "regime_Stressed",
-            ]
-            # Values in the same order as feature_names above
-            feature_values = [
-                row.get(f"{asset_prefix}_return_lag_1", 0.0),
-                row.get(f"{asset_prefix}_return_lag_3", 0.0),
-                row.get(f"{asset_prefix}_return_lag_6", 0.0),
-                row.get("realized_vol", 0.0),
-                row.get("spread_proxy", 0.0),
-                row.get("ofi", 0.0),
-                row.get("cross_asset_return", 0.0),
-                float(regime == "Calm"),
-                float(regime == "Volatile"),
-                float(regime == "Stressed"),
-            ]
-            # Use DataFrame with correct feature names to avoid sklearn warning
-            features = pd.DataFrame([feature_values], columns=feature_names)
-            pred = model.predict(features)[0]
-            if np.isnan(pred) or np.isinf(pred):
+            # Use actual lagged return (momentum signal) instead of noisy LGBM prediction
+            lag_1 = row.get(f"{asset_prefix}_return_lag_1", 0.0)
+            lag_3 = row.get(f"{asset_prefix}_return_lag_3", 0.0)
+            # Blend recent lags for smoother signal (momentum)
+            mu = 0.7 * lag_1 + 0.3 * lag_3 if not np.isnan(lag_1) and not np.isnan(lag_3) else (lag_1 if not np.isnan(lag_1) else 0.0)
+            if np.isnan(mu) or np.isinf(mu):
                 return 0.0
-            return float(pred)
+            return float(mu)
         except Exception as e:
-            # Only log once per 1000 steps to avoid spam
             if self.t % 1000 == 0:
                 import logging
                 logging.getLogger(__name__).warning(
@@ -669,13 +765,13 @@ class RegimePortfolioEnv(gym.Env):
         if not cost_model or price == 0:
             return 0.0
 
-        # FIX HIGH-1: sigma is RELATIVE volatility (fraction), not $/BTC.
+        # FIX HIGH-1 (CRITICAL): sigma is RELATIVE volatility (fraction), not $/BTC.
         # sigma_annual from calibration is std(log_returns) * sqrt(288*365),
         # which is DIMENSIONLESS (e.g., 0.57 = 57% annual vol).
-        # To get per-bar dollar impact: sigma_rel * price.
+        # The per-bar relative vol = sigma_annual / sqrt(365*288).
+        # Then market_impact = sigma * price * sqrt(q/(2*delta)) gives dollar cost.
         sigma_annual = cost_model.get("volatility", 0.0)  # relative, dimensionless
-        sigma_rel = sigma_annual / price  # relative per-bar: fraction of price
-        sigma = sigma_rel / np.sqrt(365 * 288)  # per-bar relative vol (fraction)
+        sigma = sigma_annual / np.sqrt(365 * 288)  # per-bar relative vol (fraction)
 
         s = cost_model.get("spread", 0.0)  # spread in $/BTC (absolute)
         delta = cost_model.get("depth", 1.0)  # depth in BTC/$

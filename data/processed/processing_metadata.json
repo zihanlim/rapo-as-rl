@@ -1,14 +1,14 @@
 {
-  "processed_at": "2026-04-04T10:38:08.758280",
+  "processed_at": "2026-04-10T09:56:41.336271",
   "synthetic_data": false,
   "source_symbols": [
     "BTC/USDT",
     "ETH/USDT"
   ],
-  "n_price_records": 8656,
-  "n_trade_records": 8656,
+  "n_price_records": 909473,
+  "n_trade_records": 909473,
   "date_range": {
-    "start": "2026-03-05 00:00:00",
-    "end": "2026-04-04 01:15:00"
+    "start": "2017-08-17 04:00:00",
+    "end": "2026-04-10 01:20:00"
   }
 }

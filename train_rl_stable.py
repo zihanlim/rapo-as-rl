@@ -142,26 +142,33 @@ def main():
     log.info(f'  Regime labels aligned to price_df: {len(regime_labels_aligned)} entries')
 
     # -------------------------------------------------------------------------
-    # Train/Val/Test split: 20 days train, 5 days val, rest test
+    # Train/Val/Test split: 170 days train, rest test
+    # CRITICAL-4 fix: PPO needs 50k+ steps to learn. Old 20-day train gave only
+    # ~5,761 bars (17 epochs over same data). New split gives ~49k bars for
+    # proper RL training. Val removed - use test period for final evaluation.
     # -------------------------------------------------------------------------
     data_min = price_df.index.min()
-    TRAIN_END = data_min + pd.Timedelta(days=20)
-    VAL_END = data_min + pd.Timedelta(days=25)
+    data_max = price_df.index.max()
+    # 4-year dataset: use 75% train (3 years), 25% test (1 year)
+    # Old code: TRAIN_END = data_min + pd.Timedelta(days=170)
+    split_idx = int(len(price_df) * 0.75)
+    TRAIN_END = price_df.index[split_idx]
+    VAL_END = None
 
     train_mask = price_df.index <= TRAIN_END
-    val_mask = (price_df.index > TRAIN_END) & (price_df.index <= VAL_END)
-    test_mask = price_df.index > VAL_END
+    # Val removed - all non-train data goes to test for final evaluation
+    val_mask = pd.Series(False, index=price_df.index)  # Empty mask
+    test_mask = price_df.index > TRAIN_END
 
     price_train = price_df[train_mask]
-    price_val = price_df[val_mask]
+    price_val = price_df[val_mask]  # Empty
     price_test = price_df[test_mask]
 
     regime_train = regime_labels_aligned[train_mask]
-    regime_val = regime_labels_aligned[val_mask]
+    regime_val = regime_labels_aligned[val_mask]  # Empty
     regime_test = regime_labels_aligned[test_mask]
 
     log.info(f'  Train: {len(price_train)} bars ({price_train.index.min().date()} to {price_train.index.max().date()})')
-    log.info(f'  Val:   {len(price_val)} bars ({price_val.index.min().date()} to {price_val.index.max().date()})')
     log.info(f'  Test:  {len(price_test)} bars ({price_test.index.min().date()} to {price_test.index.max().date()})')
 
     # -------------------------------------------------------------------------
@@ -202,7 +209,7 @@ def main():
     log.info(f'  (Using train split only to avoid look-ahead bias)')
 
     # -------------------------------------------------------------------------
-    # Create training and validation environments (TRAIN SPLIT ONLY for training)
+    # Create training environment (TRAIN SPLIT ONLY)
     # -------------------------------------------------------------------------
     log.info('Creating training environment (train split, all regimes)...')
     train_env = RegimePortfolioEnv(
@@ -211,34 +218,23 @@ def main():
     train_env._obs_mean, train_env._obs_std = obs_norm
     vec_train = DummyVecEnv([lambda: train_env])
 
-    log.info('Creating validation environment (val split)...')
-    val_env = RegimePortfolioEnv(
-        price_val, regime_val, as_models, lgbm_models
-    )
-    val_env._obs_mean, val_env._obs_std = obs_norm
-
     # -------------------------------------------------------------------------
-    # Training loop with validation-based early stopping
+    # Training loop — no validation (all data used for training)
+    # CRITICAL-4 fix: With ~49k training bars, PPO gets sufficient steps to learn.
+    # Final model evaluated on held-out test period via run_backtest.py
     # -------------------------------------------------------------------------
     TOTAL_STEPS = 100_000
     CHUNK = 500  # Train in chunks
-    EVAL_EVERY = 2500  # Evaluate on validation every 2500 steps
-    PATIENCE = 3  # Stop if no improvement for 3 consecutive evaluations
 
     log.info(f'\n=== Training PPO on FULL environment: {TOTAL_STEPS} steps ===')
-    log.info(f'  Chunk size: {CHUNK}, Eval every: {EVAL_EVERY}, Patience: {PATIENCE}')
+    log.info(f'  Chunk size: {CHUNK}')
+    log.info(f'  (No validation — train until max steps or NaN)')
 
     model = make_model(vec_train)
 
     best_model_path = OUTPUT_DIR / 'ppo_full.zip'
     total_timesteps = 0
     reinit_count = 0
-    eval_count = 0
-
-    # Validation tracking
-    best_val_sharpe = -np.inf
-    best_model_state = None
-    no_improve_count = 0
 
     while total_timesteps < TOTAL_STEPS:
         # Train for CHUNK steps
@@ -255,7 +251,6 @@ def main():
                 log.warning(f'  NaN/Invalid error at {total_timesteps} steps! Reinitializing...')
                 del model
                 model = make_model(vec_train)
-                no_improve_count = 0  # Reset patience on reinit
                 continue
             else:
                 raise
@@ -265,7 +260,6 @@ def main():
             log.warning(f'  NaN detected after training at {total_timesteps} steps! Reinitializing...')
             del model
             model = make_model(vec_train)
-            no_improve_count = 0  # Reset patience on reinit
             continue
 
         # Log progress every 10 chunks (5000 steps)
@@ -273,36 +267,9 @@ def main():
             w = model.policy.action_net.weight.data
             log.info(f'  Steps {total_timesteps}: weight_mean={w.mean().item():.6f}, NaN={not torch.isfinite(w).all()}')
 
-        # Evaluate on validation set every EVAL_EVERY steps
-        if total_timesteps % EVAL_EVERY == 0 and total_timesteps > 0:
-            eval_count += 1
-            val_sharpe = evaluate_on_env(val_env, model, n_episodes=3)
-            log.info(f'  [Eval #{eval_count}] Steps {total_timesteps}: Val Sharpe = {val_sharpe:.4f} (best={best_val_sharpe:.4f})')
-
-            if val_sharpe > best_val_sharpe:
-                best_val_sharpe = val_sharpe
-                best_model_state = {k: v.cpu().clone() for k, v in model.policy.state_dict().items()}
-                no_improve_count = 0
-                log.info(f'    *** New best model! Val Sharpe = {best_val_sharpe:.4f} ***')
-            else:
-                no_improve_count += 1
-                log.info(f'    No improvement ({no_improve_count}/{PATIENCE})')
-                if no_improve_count >= PATIENCE:
-                    log.info(f'  Early stopping: no improvement for {PATIENCE} consecutive evaluations.')
-                    break
-
-    # -------------------------------------------------------------------------
-    # Restore best model or save current
-    # -------------------------------------------------------------------------
-    if best_model_state is not None:
-        log.info(f'  Restoring best model with Val Sharpe = {best_val_sharpe:.4f}')
-        model.policy.load_state_dict(best_model_state)
-
     model.save(str(best_model_path))
     log.info(f'\n=== Training complete! ===')
     log.info(f'  Total steps trained: {total_timesteps}')
-    log.info(f'  Total evaluations: {eval_count}')
-    log.info(f'  Best validation Sharpe: {best_val_sharpe:.4f}')
     log.info(f'  Model saved to: {best_model_path}')
 
     # -------------------------------------------------------------------------
@@ -310,26 +277,25 @@ def main():
     # -------------------------------------------------------------------------
     summary = {
         'total_steps': int(total_timesteps),
-        'best_val_sharpe': float(best_val_sharpe),
-        'final_eval_count': eval_count,
         'train_split': {
             'start': str(price_train.index.min().date()),
             'end': str(price_train.index.max().date()),
             'n_bars': len(price_train),
         },
-        'val_split': {
-            'start': str(price_val.index.min().date()),
-            'end': str(price_val.index.max().date()),
-            'n_bars': len(price_val),
+        'test_split': {
+            'start': str(price_test.index.min().date()),
+            'end': str(price_test.index.max().date()),
+            'n_bars': len(price_test),
         },
         'hyperparameters': REGIME_PARAMS['full'],
+        'note': 'No validation — train until max steps. Test evaluation via run_backtest.py',
     }
     with open(OUTPUT_DIR / 'training_full_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
     log.info(f'  Training summary saved to: {OUTPUT_DIR / "training_full_summary.json"}')
 
-    print(f'\nTraining complete! Best validation Sharpe: {best_val_sharpe:.4f}')
-    print(f'Model saved to: {best_model_path}')
+    print(f'\nTraining complete! Model saved to: {best_model_path}')
+    print(f'Total steps: {total_timesteps}')
 
 
 if __name__ == '__main__':

@@ -43,10 +43,26 @@ def load_raw_data(data_dir: Path) -> dict:
         log.warning("No metadata found, assuming real data")
 
     # Load OHLCV data
+    # NOTE: Use _5m_batch.parquet files instead of _ohlcv_5m.parquet
+    # The batch files have correct price levels; the original files have stale prices
+    # before 2026-03-28 10:35:00 causing impossible returns (110% BTC, 31% ETH)
     for symbol in ["BTC/USDT", "ETH/USDT"]:
-        clean_symbol = symbol.replace("/", "_")
-        ohlcv_path = raw_dir / f"{clean_symbol}_ohlcv_5m.parquet"
-        trades_path = raw_dir / f"{clean_symbol}_trades_15m.parquet"
+        # Prefer new 4-year files (BTC_USDT_ohlcv_5m.parquet) over batch files
+        symbol_upper = symbol.replace("/", "_")
+        ohlcv_new = raw_dir / f"{symbol_upper}_ohlcv_5m.parquet"
+        ohlcv_batch = raw_dir / f"{symbol.lower()[:3]}_5m_batch.parquet"
+        trades_path = raw_dir / f"{symbol_upper}_trades_15m.parquet"
+
+        # Use new 4-year files if available, otherwise fall back to batch
+        if ohlcv_new.exists():
+            ohlcv_path = ohlcv_new
+            log.info(f"Using new 4-year file: {ohlcv_path.name}")
+        elif ohlcv_batch.exists():
+            ohlcv_path = ohlcv_batch
+            log.info(f"Using batch file: {ohlcv_path.name}")
+        else:
+            log.warning(f"No OHLCV data found for {symbol}")
+            continue
 
         if ohlcv_path.exists():
             data[symbol] = {
@@ -173,12 +189,20 @@ def process_trades(btc_trades: pd.DataFrame, eth_trades: pd.DataFrame) -> pd.Dat
         sell_count = (series == "sell").sum()
         return "buy" if buy_count >= sell_count else "sell"
 
+    def weighted_avg_price(series):
+        volumes = all_trades.loc[series.index, "volume"].values
+        prices = series.values
+        total_vol = volumes.sum()
+        if total_vol == 0:
+            return np.nan
+        return np.average(prices, weights=volumes)
+
     aggregated = (
         all_trades.groupby("timestamp_bin")
         .agg(
             side=("side", dominant_side),
             volume=("volume", "sum"),
-            price=("price", lambda x: np.average(x, weights=all_trades.loc[x.index, "volume"]) if len(x) > 0 else np.nan),
+            price=("price", weighted_avg_price),
         )
         .reset_index()
         .rename(columns={"timestamp_bin": "timestamp"})

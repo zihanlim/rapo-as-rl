@@ -1,0 +1,28 @@
+{
+  "total_steps": 100000,
+  "decision_interval": 288,
+  "decision_frequency": "daily (288 x 5-min bars)",
+  "train_split": {
+    "start": "2017-08-17",
+    "end": "2024-02-10",
+    "n_bars": 682105
+  },
+  "test_split": {
+    "start": "2024-02-10",
+    "end": "2026-04-10",
+    "n_bars": 227368
+  },
+  "hyperparameters": {
+    "net_arch": [
+      32,
+      32
+    ],
+    "lr": 3e-05,
+    "clip": 0.1,
+    "n_steps": 64,
+    "batch_size": 16,
+    "mgn": 0.5,
+    "log_std": -0.5
+  },
+  "note": "Daily-frequency RL training. No validation. Test evaluation via run_backtest.py"
+}

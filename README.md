@@ -23,10 +23,10 @@ Layer 2: Avellaneda-Stoikov Per-Regime Cost Model (slippage + market impact)
 Layer 3: LightGBM Return Forecaster (BTC & ETH, regime-conditional)
        │
        ▼
-Layer 4: RL Agent per Regime (PPO, Stable Baselines3)
+Layer 4: Regime-Aware PPO Agent (SINGLE regime-aware model, Stable Baselines3)
        │
        ▼
-Three-Way Backtest: Flat Baseline vs A&S+CVaR vs Full RL Agent
+Four-Way Backtest: Flat(10bps) vs Flat(A&S) vs A&S+CVaR vs RL Agent
 ```
 
 ## Project Structure
@@ -40,7 +40,7 @@ rapo-as-rl/
 │   ├── hmm/              # Trained HMM model
 │   ├── as_cost/          # Per-regime A&S calibrations
 │   ├── lgbm/             # Trained LightGBM forecasters
-│   └── rl/               # Trained PPO policies (per regime)
+│   └── rl/               # Trained PPO policy (single regime-aware model)
 ├── src/
 │   ├── layer1_hmm/       # HMM regime classifier
 │   ├── layer2_as/        # A&S cost model calibration
@@ -71,16 +71,36 @@ make as_calibrate
 # Train Layer 3: LightGBM Return Forecaster
 make lgbm
 
-# Train Layer 4: RL Policies (PPO, per regime)
+# Train Layer 4: RL Policy (PPO, single regime-aware model)
 make rl_train
 
-# Run three-way backtest
+# Run four-way backtest
 make backtest
 ```
 
 ## Key Results
 
-*(Results will be populated as training and backtesting complete)*
+**Test Period (2024-02 to 2026-04, ~227k bars):**
+
+| Strategy | Ann. Return | Sharpe | Max DD | Turnover |
+|----------|-------------|--------|--------|----------|
+| **Flat(A&S)** | **+26.2%** | **+0.48** | -56.6% | ~0 |
+| Flat(10bps) | +25.1% | +0.44 | -57.6% | ~0 |
+| A&S+CVaR | +23.4% | +0.42 | -57.1% | 0.000006 |
+| RL Agent | -3.6% | -0.68 | **-7.9%** | 0.000004 |
+
+**Key Findings:**
+- **Flat(A&S) wins** on both Ann. Return (+26.2%) and Sharpe (+0.48) vs Flat(10bps) — realistic costs show 60/40 BTC/ETH buy-and-hold is optimal
+- **No strategy is statistically significantly better** on Sharpe ratio (block bootstrap 95% CI + Benjamini-Hochberg correction at q=0.10)
+- **RL Agent has best Max Drawdown** (-7.9%) but negative Sharpe (-0.68) — learned cash is optimal under true execution costs at 5-min frequency
+- **Daily-frequency RL experiment**: Training with decision_interval=288 (daily decisions) performed WORSE (Sharpe -3.88, MaxDD -39.1%) than 5-min RL (Sharpe -0.68). Only ~789 effective decisions during training vs 100k at 5-min. Both converge to cash-optimal. Reducing decision frequency does NOT solve the A&S cost problem.
+- **Core finding**: Execution costs dominate active rebalancing returns. A single 50bps trade costs ~123 bps in Calm regime — 2.5x nominal. CVaR optimizer with realistic costs correctly stays near passive holding.
+
+**Statistical Testing (Bootstrap 95% CI for Sharpe, block size=288 bars):**
+- Flat(10bps): [−0.84, +1.65]
+- Flat(A&S): [−0.79, +1.68]
+- A&S+CVaR: [−0.84, +1.61]
+- RL: [0.000, 0.000] (insufficient rebalancing for bootstrap)
 
 ## Literature
 

@@ -32,17 +32,17 @@
 
 ## Phase 4: Layer 4 — PPO Agent
 - [✅] Gymnasium environment (RegimePortfolioEnv)
-- [✅] Per-regime PPO policies (lr×γ×clip grid search)
-- [✅] Early stopping (rolling Sharpe ±0.05)
-- [✅] Policy persistence (.zip)
+- [✅] Single regime-aware PPO policy (replaced per-regime approach due to insufficient training data per regime)
+- [✅] Ultra-conservative hyperparameters ([32,32] net, lr=3e-5, clip=0.1)
+- [✅] Policy persistence (ppo_full.zip)
 
 ## Phase 5: Backtest & Analysis
-- [ ] Complete `05_backtest_analysis.ipynb` — three-way comparison
-- [ ] Metrics: Sharpe, max drawdown, PnL, turnover, regime exposure
-- [ ] Statistical significance testing (bootstrap / permutation)
-- [ ] Regime-conditional performance breakdown
-- [ ] Transaction cost sensitivity analysis
-- [ ] Generate all 5 notebooks with write_backtest_nb.py
+- [✅] Complete `05_backtest_analysis.ipynb` — four-way comparison
+- [✅] Metrics: Sharpe, max drawdown, PnL, turnover, regime exposure
+- [✅] Statistical significance testing (block bootstrap + Benjamini-Hochberg)
+- [✅] Regime-conditional performance breakdown
+- [~] Transaction cost sensitivity analysis (partially covered)
+- [✅] Backtest results: Flat(A&S) wins on Sharpe (+0.48) and Return (+26.2%)
 
 ## Phase 6: Thesis / Writeup
 - [ ] Literature review integration
@@ -50,4 +50,4 @@
 - [ ] Citation formatting
 - [ ] Abstract + introduction
 
-*Last updated: 2026-04-04*
+*Last updated: 2026-04-12*
