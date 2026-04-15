@@ -1,17 +1,27 @@
 """
-Layer 2: Avellaneda-Stoikov Per-Regime Cost Model — Calibration
+Layer 2: Adapted Avellaneda-Stoikov Per-Regime Execution Cost Model — Calibration
 
-Calibrates A&S microstructure cost parameters separately for each HMM regime
+Calibrates microstructure cost parameters separately for each HMM regime
 (Calm, Volatile, Stressed) using Binance trade tick data.
 
-A&S Model:
-    Cost(q, σ, s, δ, γ) = σ·√(q/(2δ))·P + s/2·P + γ·q²/(2δ)·P
+IMPORTANT — This is an ADAPTED execution cost model, NOT the original A&S market-maker formula:
+- Original A&S (market-making): reservation price r(t,q) = s(t) - q·γ·σ²·(T-t), with LINEAR inventory penalty in q
+- Our implementation (execution cost): Cost = σ·√(q/(2δ))·P + s/2·P + γ·q²/(2δ)·P, with QUADRATIC penalty in q
 
-where:
+The three components are:
+  1. market_impact = σ·P·√(q/(2δ))       — square-root impact (A&S inspired, empirically validated)
+  2. spread_cost   = (s/2)·q               — half-spread × quantity (standard execution cost)
+  3. inventory_risk = γ·q²/(2δ)·P        — quadratic trade-size penalty (Almgren-Chriss, NOT A&S)
+
+The depth parameter δ is recovered from the A&S equilibrium δ = 2/(s·P), then plugged into
+the square-root impact formula — this calibration approach follows A&S, but the overall
+cost decomposition is the standard Almgren-Chriss execution cost model.
+
+Parameters:
     q   = order size (in asset units)
-    σ   = asset volatility (annualized)
+    σ   = asset volatility (annualized, relative)
     s   = bid-ask spread (in price units)
-    δ   = market depth per price unit
+    δ   = market depth per price unit (calibrated from A&S equilibrium)
     γ   = risk aversion parameter
     P   = current price
 

@@ -61,9 +61,14 @@ The original design used **separate PPO per regime** (3 models). This was WRONG 
 - Multiple random initializations (5 seeds) to avoid local optima
 - Output: `models/hmm/regime_labels.csv`, `hmm_model.pkl`
 
-### Layer 2 — Avellaneda-Stoikov
+### Layer 2 — Avellaneda-Stoikov (Adapted Execution Cost Model)
 - Calibrate per regime: σ (vol), s (spread), δ (depth), γ (risk-aversion)
-- A&S cost = σ·√(q/(2δ))·P + s/2·P + γ·q²/(2δ)·P
+- **Adapted** execution cost decomposition (Almgren-Chriss, 2000), not the original A&S market-maker formula
+- Cost = σ·√(q/(2δ))·P + s/2·P + γ·q²/(2δ)·P
+  - market_impact = σ·P·√(q/(2δ)) — square-root impact form (A&S inspired)
+  - spread_cost = (s/2)·q — half-spread × quantity (standard execution cost)
+  - inventory_risk = γ·q²/(2δ)·P — quadratic trade-size penalty (NOT A&S's linear q inventory term)
+- δ calibrated via A&S equilibrium: δ = 2/(s·P) (A&S contribution), then plugged into square-root impact (adapted)
 - **FIXED**: σ is relative volatility (fraction), NOT absolute $/BTC
 - Lee-Ready tick rule for trade direction
 - Stressed corrections: spread forced 10.5x calm, vol forced 2x calm

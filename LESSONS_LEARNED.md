@@ -799,6 +799,12 @@ impact_cost = gamma * q^2 / (2 * delta) * price  # dollars
 
 **Status: CONSISTENT across all components.** The SIGMA_BUG (CRITICAL-4) was correctly fixed in both places.
 
+**Important — Adapted execution cost model, NOT the original A&S market-maker formula:**
+- Original A&S (market-making): reservation price r(t,q) = s(t) - q·γ·σ²·(T-t), with LINEAR inventory penalty in q
+- Our implementation: standard Almgren-Chriss execution cost decomposition with A&S-calibrated parameters (σ, s, δ)
+  - The square-root impact form is A&S-inspired; the γ·q² penalty is Almgren-Chriss, NOT A&S's linear q term
+  - δ is calibrated via the A&S equilibrium (δ = 2/(s·P)), then plugged into the adapted formula
+
 ### Issue 7: No Per-Trading-Cost Budget Constraint — FIXED (2026-04-10)
 
 **Problem:** `run_as_cvar_strategy()` kept rebalancing until portfolio destruction, with no cap on cumulative costs.
