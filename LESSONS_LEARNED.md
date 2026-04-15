@@ -552,7 +552,7 @@ This is a well-balanced distribution across all three regimes — stressed regim
 
 **CRITICAL INSIGHT — 4-Year vs 10-Year Test Period:**
 
-The 4-year test period (2025-04 to 2026-04) covered ONLY the bull market recovery, giving Flat(10bps) an apparent Sharpe of +0.48. The 10-year test period (2024-02 to 2026-04) includes the 2022-2023 bear market, revealing Flat(10bps)'s TRUE Sharpe of -0.84.
+The 4-year test period (2025-04 to 2026-04) covered ONLY the bull market recovery, giving Flat(10bps) an apparent Sharpe of +0.48. The 10-year test period (2024-02 to 2026-04) does NOT include the 2022-2023 bear market (that is in training data). The test period covers post-bear-market recovery and Q1 2025 volatility events, revealing Flat(10bps)'s TRUE Sharpe of +0.48 on this post-recovery data.
 
 This is why optimistic cost assumptions (Flat 10bps) are dangerous — they can make a strategy look good in a bull market but fail catastrophically over a full cycle.
 
@@ -633,7 +633,7 @@ This is a legitimate research finding — it doesn't say "don't invest in BTC," 
 ### Why This Matters for the Capstone
 
 1. The A&S model correctly calibrated regime-conditional execution costs for the first time
-2. The 10-year test period validates findings across full bull/bear market cycles
+2. The test period (2024-02 to 2026-04) covers post-recovery and Q1 2025 volatility — the 2022-2023 bear market is in training data
 3. The RL trained on true costs found the genuinely optimal policy (cash preservation)
 4. This validates the entire pipeline: costs → RL → policy that accounts for reality
 
