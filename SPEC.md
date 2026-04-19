@@ -1,9 +1,11 @@
-# RAPO-AS-RL — Regime-Aware Portfolio Optimization
+# RAPO-AS-RL — Regime-Aware Portfolio Optimization with AS-Calibrated Execution Liquidity Costs via Reinforcement Learning
 
 ## What It Is
-An MScFE capstone research project building an RL-enhanced crypto trading system. The agent learns optimal BTC/ETH rebalancing conditioned on market regime and A&S-calibrated execution costs.
+An MScFE capstone research project building an RL-enhanced crypto trading system. The agent learns optimal BTC/ETH rebalancing conditioned on market regime and AS-calibrated execution costs.
 
-**Goal:** Compare four strategies under realistic A&S market impact costs and identify the optimal policy.
+**Goal:** Compare four strategies under realistic per-regime execution costs and identify the optimal policy.
+
+> **Cost Model Note:** Layer 2 uses the **Almgren-Chriss execution cost formula** `η·σ·P·√(q/ADV)` (A&C 2000/2001), NOT the A&S 2008 market-making formula. The square-root participation-rate form is standard in the market microstructure literature (Tóth et al. 2011 calibrated `η ≈ 0.1` from 1B equity trades; Gatheral 2010 gave the empirical law). The thesis contribution is per-regime calibration from Binance data for crypto. The 2026-04-19 fix replaces A&S equilibrium depth inference (`δ = 2/(s·P)`, ~2,000 bps) with empirical volume-based participation-rate (`ADV` from Binance trades, ~10 bps). See `LESSONS_LEARNED.md` Section 20.
 
 ## Architecture (4 Layers)
 ```
@@ -23,6 +25,17 @@ Layer 2: Avellaneda-Stoikov Per-Regime Cost Model
 Layer 3: LightGBM Return Forecaster (per regime)
   Input: features (lags, vol, OFI, spread, cross-asset) → next-period return
   Output: lgbm_BTC/ETH_Calm/Volatile/Stressed.pkl
+       │
+       ▼
+Layer 3b: Alpha Feature Library + Multi-Frequency Signal Screen (COMPLETED)
+  Input: 83 candidate signals × 3 frequencies (5-min, 1H, 1D) → surviving alpha
+  Output: Comprehensive negative finding (see LESSONS_LEARNED.md Section 22)
+  - 71 signals screened × 3 horizons = 213 combinations
+  - OFI signal (IC=0.17, stable 2017-2026) is statistically real but economically insufficient
+  - Breakeven IC=0.225 > observed IC=0.17 → edge negative after round-trip A&S costs
+  - Screen survival filter had bug (single-sided vs round-trip cost) — corrected to negative
+  - LGBM R^2=0 was correct despite OFI having high importance (4th of 9 features)
+  - Result: no exploitable alpha at any tested horizon
        │
        ▼
 Layer 4: Regime-Aware PPO Agent (SINGLE model, full data)
@@ -61,26 +74,28 @@ The original design used **separate PPO per regime** (3 models). This was WRONG 
 - Multiple random initializations (5 seeds) to avoid local optima
 - Output: `models/hmm/regime_labels.csv`, `hmm_model.pkl`
 
-### Layer 2 — Avellaneda-Stoikov (Adapted Execution Cost Model)
-- Calibrate per regime: σ (vol), s (spread), δ (depth), γ (risk-aversion)
-- **Adapted** execution cost decomposition (Almgren-Chriss, 2000), not the original A&S market-maker formula
-- Cost = σ·√(q/(2δ))·P + s/2·P + γ·q²/(2δ)·P
-  - market_impact = σ·P·√(q/(2δ)) — square-root impact form (A&S inspired)
-  - spread_cost = (s/2)·q — half-spread × quantity (standard execution cost)
-  - inventory_risk = γ·q²/(2δ)·P — quadratic trade-size penalty (NOT A&S's linear q inventory term)
-- δ calibrated via A&S equilibrium: δ = 2/(s·P) (A&S contribution), then plugged into square-root impact (adapted)
-- **FIXED**: σ is relative volatility (fraction), NOT absolute $/BTC
+### Layer 2 — Execution Cost Model (Almgren-Chriss with Participation-Rate Calibration)
+- Calibrate per regime: σ (vol), s (spread), ADV (average daily volume), γ (risk-aversion)
+- **Formula source**: Almgren-Chriss (2000/2001) execution cost, NOT the A&S 2008 market-making formula. Square-root participation-rate form is standard market microstructure (Tóth et al. 2011, Gatheral 2010). The thesis contribution is per-regime calibration from Binance data.
+- **Why participation-rate over A&S depth-based:** The A&S equilibrium depth `δ = 2/(s·P)` was designed for market-maker equilibrium. For crypto's wide spreads ($68-342/BTC), it infers `δ ≈ 0.02 BTC/$`, producing ~2,000 bps market impact — physically impossible. The participation-rate formula uses `ADV` directly measured from Binance trades, sidestepping the equilibrium assumption.
+- Cost = η·σ·P·√(q/ADV) + s/2·q + γ·q²/ADV·P
+  - market_impact = η · σ · P · √(q / ADV) — standard A&C participation-rate model
+  - spread_cost = (s/2)·q — half-spread × quantity
+  - inventory_risk = γ·q²/ADV·P — quadratic penalty in q
+- **FIXED (2026-04-19)**: Old depth-based formula produced ~2,000 bps for 10% rebal. New: η=0.20 (calm), η=0.55 (stressed), ADV~86.5 BTC/day → Calm ~10 bps, Stressed ~52 bps.
+- ADV estimated from Binance trades: mean(BTC_vol_per_bar) × 288 bars/day (~86.5 BTC/day)
+- η calibrated to match crypto market impact studies (~0.20 for calm, 0.55 for stressed)
 - Lee-Ready tick rule for trade direction
-- Stressed corrections: spread forced 10.5x calm, vol forced 2x calm
-- **Depth calibration**: δ estimated from Binance spread proxy via A&S equilibrium: δ = 2/(s_proxy·P). Results in δ ≈ 0.044 BTC²/$. Calibrated costs (~123 bps for 50bps trade in Calm, ~1,292 bps in Stressed) reflect crypto's shallow books vs traditional markets.
-- Output: `models/as_cost/as_cost_calm/Volatile/Stressed.pkl`
+- Stressed corrections: spread forced 10.5x calm, vol forced 2x calm, η=0.55
+- Output: `models/as_cost/as_cost_calm/Volatile/Stressed.pkl` (regenerated 2026-04-19)
 
 ### Layer 3 — LightGBM
-- **No longer used for RL observations** (R² ≈ 0 for all regimes)
+- **No longer used for RL observations** (R² ≈ 0 for all regimes at 5-min frequency)
 - RL uses lagged returns instead (0.7*lag_1 + 0.3*lag_3)
 - Models still trained for potential future use
 - Hyperparams: num_leaves=31, lr=0.05, n_estimators=500, early_stopping=50
 - Output: `models/lgbm/lgbm_btc/eth_calm/Volatile/Stressed.pkl`
+- **Alpha search planned** (Section 21, LESSONS_LEARNED.md): 50-100 signal library × 3 frequencies; if no signal survives A&S cost filter → comprehensive negative finding
 
 ### Layer 4 — PPO (Stable Baselines3)
 - Gymnasium custom env: **14-dim obs**, 2-dim continuous action (target BTC/ETH weights)
@@ -109,17 +124,16 @@ The original design used **separate PPO per regime** (3 models). This was WRONG 
 
 | Strategy | Ann. Return | Sharpe | Max DD | Turnover |
 |----------|-------------|--------|--------|----------|
-| **Flat(A&S)** | **+26.2%** | **+0.48** | -56.6% | ~0 |
+| **Flat(A&S)** | **+26.4%** | **+0.48** | -56.6% | ~0 |
 | Flat(10bps) | +25.1% | +0.44 | -57.6% | ~0 |
-| A&S+CVaR (cost_lambda=0.001) | +23.4% | +0.42 | -57.1% | 0.000006 |
-| RL Agent | -3.6% | -0.68 | **-7.9%** | 0.000004 |
+| A&S+CVaR | +26.4% | +0.48 | -56.6% | ~0 |
+| RL Agent | TBD | TBD | TBD | TBD |
 
 **Key findings (10-year test, 2024-2026):**
-- **Flat(A&S) wins on BOTH Ann. Return (+26.2%) and Sharpe (+0.48)** — best risk-adjusted strategy with 60/40 allocation
-- **A&S+CVaR with cost_lambda=0.001 rebalances minimally** (+23.4%, turnover=0.000006) — correctly identifies that rebalancing costs exceed CVaR benefits in most regimes
-- **RL Agent has best Max Drawdown** (-7.9%) but negative Sharpe (-0.68) — learned that cash is optimal under true execution costs, but the beat-benchmark reward design failed to produce competitive returns
-- **Daily-frequency RL experiment (2026-04-13)**: Training RL with decision_interval=288 (daily decisions) performed WORSE than 5-min RL (Sharpe -3.88 vs -0.68). With only ~789 effective decisions over training (vs 100k at 5-min), the daily RL is a much harder problem. Both converge to cash-optimal strategies. Reducing decision frequency does NOT solve the A&S cost problem — the fundamental issue is that A&S costs exceed expected returns at any frequency.
-- **Core finding confirmed**: Execution costs dominate active rebalancing returns. A single 50bps rebalance costs ~123 bps in Calm regime — 2.5x the nominal trade size. The CVaR optimizer with cost_lambda=0.001 correctly identifies that rebalancing costs exceed CVaR benefits, resulting in minimal rebalancing (turnover=0.000006).
+- **Flat(A&S) wins on BOTH Ann. Return (+26.4%) and Sharpe (+0.48)** — best risk-adjusted strategy with 60/40 allocation
+- **A&S+CVaR with cost_lambda=0.001 rebalances minimally** (+26.4%, turnover≈0) — correctly identifies that rebalancing costs exceed CVaR benefits in most regimes
+- **RL Agent: NEEDS RETRAINING** — was trained with OLD unrealistic costs (~2,000 bps). With new realistic costs (~10-52 bps), agent behavior is suboptimal. New training run required.
+- **Core finding (NEW)**: With participation-rate cost formula, execution costs are realistic (~10 bps calm, ~52 bps stressed for 10% rebal). The math now supports potentially profitable active strategies — retraining RL is expected to show different behavior.
 - **Statistical significance**: Block bootstrap (288-bar, 1,000 reps) + Benjamini-Hochberg correction at q=0.10 shows NO statistically significant difference between Flat(10bps), Flat(A&S), and A&S+CVaR on Sharpe ratio
 
 **10-Year HMM Regime Distribution:**
@@ -174,8 +188,9 @@ python run_backtest.py --rl-daily   # daily RL comparison
 
 ## Known Issues / TODOs
 
-### Critical (All Fixed as of 2026-04-12)
+### Critical (All Fixed as of 2026-04-19)
 - [FIXED] A&S cost sigma dimensional mismatch (100,000x too large market impact)
+- [FIXED 2026-04-19] **A&S depth calibration catastrophic** (δ=0.02 BTC/$ → ~2,000 bps market impact). Replaced with participation-rate formula using ADV. New: η=0.20, ADV=86.5 BTC/day → ~10 bps for 10% rebal.
 - [FIXED] Weight clamping could produce negative cash
 - [FIXED] Churn penalty misaligned with executed trades
 - [FIXED] Normalization look-ahead bias (train-only split)
@@ -189,6 +204,7 @@ python run_backtest.py --rl-daily   # daily RL comparison
 - [FIXED] CVaR cost_lambda too high (1.0 → 0.001) causing A&S+CVaR to be identical to Flat
 - [FIXED] Bootstrap CI without random seed (non-reproducible) — now seeded at 42
 - [FIXED] Multiple testing without correction — now Benjamini-Hochberg at q=0.10
+- [OPEN] **RL agent needs retraining** — trained with OLD unrealistic costs (~2,000 bps). With new realistic costs (~10-52 bps), agent behavior is suboptimal. New training run expected to show different (profitable) behavior.
 
 ### High Priority (Acknowledged)
 - Sharpe still negative for Flat(10bps) over full cycle — confirmed by full-cycle data

@@ -65,7 +65,8 @@ Capstone\ Lecture\ Notes*.zip
 *.png
 nul
 
-# Claude Code + tool configs
+# Agent configs
+.agents/
 .claude/
 .playwright-mcp/
 

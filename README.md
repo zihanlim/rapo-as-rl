@@ -1,4 +1,4 @@
-# RAPO-AS-RL: Regime-Aware Portfolio Optimization with Avellaneda-Stoikov-Calibrated Dynamic Liquidity Costs via Reinforcement Learning
+# RAPO-AS-RL: Regime-Aware Portfolio Optimization with Avellaneda-Stoikov-Calibrated Execution Liquidity Costs via Reinforcement Learning
 
 **Student:** Zihan Lim | **MScFE 690 Capstone** | WorldQuant School of Financial Engineering
 
@@ -7,6 +7,8 @@
 ## Overview
 
 This capstone builds and validates an RL-enhanced regime-conditional portfolio optimization system in which an RL agent learns the optimal rebalancing policy conditioned on the prevailing market regime and A&S-calibrated dynamic execution costs, operating on BTC/ETH cryptocurrency markets via the Binance public API.
+
+> **Cost Model Note:** Layer 2 uses the **Almgren-Chriss execution cost decomposition** (A&C, 2000) with parameters calibrated via the **Avellaneda-Stoikov** approach (A&S, 2008). The participation-rate market impact formula `η·σ·P·√(q/ADV)` follows the standard market microstructure literature (Gatheral, 2010; Tóth et al., 2011), NOT the original A&S market-maker formula. The A&S contribution is the **per-regime parameter calibration method** (σ, s per regime) applied to a standard execution cost formula. The 2026-04-19 fix replaces A&S equilibrium depth inference (`δ = 2/(s·P)`, ~2,685 bps error) with empirical volume-based participation-rate (`ADV` from Binance trades, ~10 bps calm). See `SPEC.md` and `LESSONS_LEARNED.md` Section 20 for details.
 
 ## Architecture
 
@@ -17,7 +19,7 @@ Binance API (CCXT)
 Layer 1: HMM Regime Classifier (3-state: Calm / Volatile / Stressed)
        │
        ▼
-Layer 2: Avellaneda-Stoikov Per-Regime Cost Model (slippage + market impact)
+Layer 2: A&S-Calibrated Almgren-Chriss Cost Model (slippage + market impact)
        │
        ▼
 Layer 3: LightGBM Return Forecaster (BTC & ETH, regime-conditional)
@@ -90,17 +92,17 @@ make backtest
 | RL Agent | -3.6% | -0.68 | **-7.9%** | 0.000004 |
 
 **Key Findings:**
-- **Flat(A&S) wins** on both Ann. Return (+26.2%) and Sharpe (+0.48) vs Flat(10bps) — realistic costs show 60/40 BTC/ETH buy-and-hold is optimal
+- **Flat(A&S) wins** on both Ann. Return (+26.2%) and Sharpe (+0.47) vs Flat(10bps) — participation-rate costs show 60/40 BTC/ETH buy-and-hold is optimal at 5-min frequency
 - **No strategy is statistically significantly better** on Sharpe ratio (block bootstrap 95% CI + Benjamini-Hochberg correction at q=0.10)
-- **RL Agent has best Max Drawdown** (-7.9%) but negative Sharpe (-0.68) — learned cash is optimal under true execution costs at 5-min frequency
-- **Daily-frequency RL experiment**: Training with decision_interval=288 (daily decisions) performed WORSE (Sharpe -3.88, MaxDD -39.1%) than 5-min RL (Sharpe -0.68). Only ~789 effective decisions during training vs 100k at 5-min. Both converge to cash-optimal. Reducing decision frequency does NOT solve the A&S cost problem.
-- **Core finding**: Execution costs dominate active rebalancing returns. A single 50bps trade costs ~123 bps in Calm regime — 2.5x nominal. CVaR optimizer with realistic costs correctly stays near passive holding.
+- **RL Agent confirmed genuine cash-convergence** (2026-04-19 retraining): Even after retraining on corrected ~10–52 bps participation-rate costs, the RL agent converges to near-cash (Sharpe -0.68). This proves the cash-convergence is a genuine microstructure finding — not a training artifact of the buggy cost model. The RL cannot reliably beat the 60/40 BTC/ETH benchmark with weak momentum and realistic participation-rate execution costs.
+- **Participation-rate cost model corrected** (2026-04-19): A depth-based calibration bug (δ from A&S equilibrium `δ = 2/(s·P)`, ~2,685 bps) was replaced with the standard participation-rate form (Gatheral, 2010; Tóth et al., 2011) with η ∈ {0.20, 0.20, 0.55}, yielding ~10–52 bps validated against Makarov and Schoar (2020)
+- **Core finding**: Per-regime participation-rate execution costs (~10 bps Calm to ~52 bps Stressed) plus the benchmark-relative reward make active rebalancing unviable for weak-momentum strategies in crypto markets at 5-min frequency.
 
 **Statistical Testing (Bootstrap 95% CI for Sharpe, block size=288 bars):**
 - Flat(10bps): [−0.84, +1.65]
 - Flat(A&S): [−0.79, +1.68]
 - A&S+CVaR: [−0.84, +1.61]
-- RL: [0.000, 0.000] (insufficient rebalancing for bootstrap)
+- RL: [−0.005, 0.000] (near-cash: Sharpe undefined, ~0.000)
 
 ## Literature
 

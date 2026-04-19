@@ -1,0 +1,438 @@
+"""
+Layer 3b: Alpha Feature Library
+==============================
+Computes 50-100 candidate alpha signals across multiple categories:
+  1. TA-Lib style technical indicators (trend, momentum, volatility, volume)
+  2. Order flow features (OFI at multiple depths, trade intensity, etc.)
+  3. Crypto-specific features (volume/price ratios, realized vs implied vol)
+  4. Cross-asset features (BTC-ETH correlation, dominance proxies, relative strength)
+
+All features are computed from existing price_features.parquet and trades_processed.parquet.
+No new data fetching required.
+
+Usage:
+    python -m src.layer3b_alpha.feature_library --prices data/processed/price_features.parquet \\
+                                                  --trades data/processed/trades_processed.parquet \\
+                                                  --output data/processed/alpha_features.parquet
+"""
+
+import argparse
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+# =============================================================================
+# CATEGORY 1: Technical Indicators (pandas/numpy implementations)
+# =============================================================================
+
+def compute_sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
+
+def compute_ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(window).mean()
+    loss = (-delta.clip(upper=0)).rolling(window).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    atr = tr.rolling(window).mean()
+    plus_di = 100 * (plus_dm.rolling(window).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(window).mean() / atr)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.rolling(window).mean()
+    return adx
+
+def compute_cci(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 20) -> pd.Series:
+    tp = (high + low + close) / 3
+    sma_tp = tp.rolling(window).mean()
+    mad = tp.rolling(window).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    cci = (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
+    return cci
+
+def compute_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_window: int = 14, d_window: int = 3) -> Tuple[pd.Series, pd.Series]:
+    lowest_low = low.rolling(k_window).min()
+    highest_high = high.rolling(k_window).max()
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
+    d = k.rolling(d_window).mean()
+    return k, d
+
+def compute_roc(series: pd.Series, window: int = 12) -> pd.Series:
+    return 100 * (series - series.shift(window)) / series.shift(window).replace(0, np.nan)
+
+def compute_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    highest_high = high.rolling(window).max()
+    lowest_low = low.rolling(window).min()
+    wr = -100 * (highest_high - close) / (highest_high - lowest_low).replace(0, np.nan)
+    return wr
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    return tr.rolling(window).mean()
+
+def compute_bollinger_bands(series: pd.Series, window: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    sma = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    upper = sma + num_std * std
+    lower = sma - num_std * std
+    bandwidth = (upper - lower) / sma.replace(0, np.nan)
+    percent_b = (series - lower) / (upper - lower).replace(0, np.nan)
+    return upper, sma, lower
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    return obv
+
+def compute_mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 14) -> pd.Series:
+    tp = (high + low + close) / 3
+    mf = tp * volume
+    mf_diff = mf.diff()
+    pos_mf = mf_diff.clip(lower=0).rolling(window).sum()
+    neg_mf = (-mf_diff.clip(upper=0)).rolling(window).sum()
+    mfi = 100 - (100 / (1 + pos_mf / neg_mf.replace(0, np.nan)))
+    return mfi
+
+def compute_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
+    money_flow = ((close - low) - (high - close)) / (high - low).replace(0, np.nan) * volume
+    return money_flow.rolling(window).sum() / volume.rolling(window).sum()
+
+# =============================================================================
+# CATEGORY 2: Order Flow Features (from trade tick data)
+# =============================================================================
+
+def compute_ofi(trades_df: pd.DataFrame, price_df: pd.DataFrame, depth_levels: List[int] = [1, 5, 10]) -> pd.DataFrame:
+    """
+    Compute Order Flow Imbalance at multiple depth levels.
+    Requires trade-level data with side classification (buy/sell).
+    """
+    if trades_df.empty or 'side' not in trades_df.columns:
+        return pd.DataFrame()
+
+    # Align trades to price bar timestamps
+    df = trades_df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    price_df = price_df.copy()
+    price_df['timestamp'] = pd.to_datetime(price_df['timestamp'])
+
+    # Aggregate per price bar
+    ofi_features = {}
+    for depth in depth_levels:
+        # Simple OFI: net buyer-initiated volume per bar
+        buy_vol = df[df['side'] == 'buy'].groupby('timestamp')['volume'].sum()
+        sell_vol = df[df['side'] == 'sell'].groupby('timestamp')['volume'].sum()
+        ofi = (buy_vol - sell_vol).fillna(0)
+        ofi_features[f'ofi_depth{depth}'] = ofi
+
+    # Trade intensity: number of trades per bar
+    trade_count = df.groupby('timestamp').size()
+    ofi_features['trade_count'] = trade_count
+
+    result = pd.DataFrame(ofi_features)
+    result.index = pd.to_datetime(result.index)
+    return result
+
+def compute_order_flow_acorr(trades_df: pd.DataFrame, lags: List[int] = [1, 3, 5]) -> pd.Series:
+    """Compute autocorrelation of order flow imbalance."""
+    if trades_df.empty or 'side' not in trades_df.columns:
+        return pd.Series(dtype=float)
+
+    buy_vol = trades_df[trades_df['side'] == 'buy'].groupby('timestamp')['volume'].sum().reindex(trades_df['timestamp'].unique()).fillna(0)
+    sell_vol = trades_df[trades_df['side'] == 'sell'].groupby('timestamp')['volume'].sum().reindex(trades_df['timestamp'].unique()).fillna(0)
+    ofi = buy_vol - sell_vol
+
+    acorr = {}
+    for lag in lags:
+        acorr[f'ofi_acorr_lag{lag}'] = ofi.autocorr(lag=lag)
+    return pd.Series(acorr)
+
+# =============================================================================
+# CATEGORY 3: Crypto-Specific Features
+# =============================================================================
+
+def compute_crypto_features(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute crypto-specific features from price data."""
+    df = price_df.copy()
+    features = {}
+
+    # Per-dollar volume (volume / close) — normalized activity
+    features['volume_per_dollar'] = df['volume'] / df['close'].replace(0, np.nan)
+
+    # Volume momentum (volume growth rate)
+    features['volume_roc'] = compute_roc(df['volume'].replace(0, np.nan), window=20)
+
+    # Spread proxy already exists; compute spread momentum
+    if 'spread_proxy' in df.columns:
+        features['spread_roc'] = compute_roc(df['spread_proxy'].replace(0, np.nan), window=20)
+        features['spread_zscore'] = (df['spread_proxy'] - df['spread_proxy'].rolling(50).mean()) / df['spread_proxy'].rolling(50).std()
+
+    # Price-volume correlation (rolling)
+    features['price_volume_corr'] = df['close'].rolling(20).corr(df['volume'])
+
+    # Return volatility ratio (short-term vs long-term vol)
+    vol_short = df['btc_return'].rolling(5).std() if 'btc_return' in df.columns else df['close'].pct_change().rolling(5).std()
+    vol_long = df['btc_return'].rolling(20).std() if 'btc_return' in df.columns else df['close'].pct_change().rolling(20).std()
+    features['vol_ratio_short_long'] = vol_short / vol_long.replace(0, np.nan)
+
+    # Overnight gap proxy (close to next open — not applicable for crypto 24/7, use intraday gap)
+    features['intraday_gap'] = df['open'] - df['close'].shift(1)
+
+    return pd.DataFrame(features)
+
+# =============================================================================
+# CATEGORY 4: Cross-Asset Features
+# =============================================================================
+
+def compute_cross_asset_features(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute cross-asset features (BTC-ETH relationship)."""
+    df = price_df.copy()
+    features = {}
+
+    # BTC-ETH correlation
+    if 'btc_return' in df.columns and 'eth_return' in df.columns:
+        features['btc_eth_corr'] = df['btc_return'].rolling(20).corr(df['eth_return'])
+
+        # Relative strength (ETH/BTC ratio)
+        eth_btc_ratio = (df['eth_close'] / df['btc_close'].replace(0, np.nan))
+        features['eth_btc_ratio'] = eth_btc_ratio
+        features['eth_btc_ratio_roc'] = compute_roc(eth_btc_ratio, window=5)
+        features['eth_btc_ratio_roc20'] = compute_roc(eth_btc_ratio, window=20)
+
+        # ETH outperforming BTC (return differential)
+        features['eth_vs_btc_return'] = df['eth_return'] - df['btc_return']
+        features['eth_vs_btc_return_cum'] = features['eth_vs_btc_return'].rolling(20).sum()
+
+    # BTC dominance proxy (BTC volume / total volume — need ETH volume separately)
+    # Use price-based proxy: BTC return relative to cross-asset return
+    if 'btc_return' in df.columns and 'eth_return' in df.columns:
+        total_crypto_return = 0.7 * df['btc_return'] + 0.3 * df['eth_return']
+        features['btc_return_share'] = df['btc_return'] / total_crypto_return.replace(0, np.nan)
+
+    # Cross-asset lead-lag (BTC leads ETH?)
+    for lag in [1, 3, 5]:
+        if 'btc_return' in df.columns:
+            features[f'btc_leads_eth_lag{lag}'] = df['btc_return'].corr(df['eth_return'].shift(lag))
+
+    # Regime-conditional return features
+    if 'btc_return' in df.columns:
+        features['btc_return_positive_pct'] = df['btc_return'].rolling(20).apply(lambda x: (x > 0).mean(), raw=True)
+        features['btc_return_skew'] = df['btc_return'].rolling(20).skew()
+
+    return pd.DataFrame(features)
+
+# =============================================================================
+# MAIN: Compute Full Feature Library
+# =============================================================================
+
+def compute_alpha_features(
+    price_path: str = "data/processed/price_features.parquet",
+    trades_path: str = "data/processed/trades_processed.parquet",
+    output_path: str = "data/processed/alpha_features.parquet"
+) -> pd.DataFrame:
+    """
+    Compute all alpha features from existing processed data.
+    All features are stored as numpy arrays to avoid pandas index alignment issues.
+    """
+    print(f"Loading price data from {price_path}...")
+    price_df = pd.read_parquet(price_path)
+    price_df['timestamp'] = pd.to_datetime(price_df['timestamp'])
+
+    print(f"Loading trade data from {trades_path}...")
+    try:
+        trades_df = pd.read_parquet(trades_path)
+        trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
+    except Exception as e:
+        print(f"Warning: Could not load trades: {e}. Order flow features will be skipped.")
+        trades_df = pd.DataFrame()
+
+    print("Computing features...")
+
+    n = len(price_df)
+    timestamps = price_df['timestamp'].values
+
+    # Raw arrays
+    close = price_df['close'].replace(0, np.nan).values
+    high = price_df['high'].replace(0, np.nan).values
+    low = price_df['low'].replace(0, np.nan).values
+    volume = price_df['volume'].replace(0, np.nan).values
+    btc_close = price_df['btc_close'].values
+    eth_close = price_df['eth_close'].values
+    btc_return = price_df['btc_return'].values
+    eth_return = price_df['eth_return'].values
+    spread_proxy = price_df['spread_proxy'].values
+
+    # Forward returns (targets)
+    fwd_return_5min = np.full(n, np.nan)
+    fwd_return_5min[:-1] = close[1:] / close[:-1] - 1
+    fwd_return_1h = np.full(n, np.nan)
+    fwd_return_1h[:-12] = close[12:] / close[:-12] - 1
+    fwd_return_1d = np.full(n, np.nan)
+    fwd_return_1d[:-288] = close[288:] / close[:-288] - 1
+
+    # ---- Build feature dict ----
+    feat: Dict[str, np.ndarray] = {}
+
+    # Forward returns
+    feat['fwd_return_5min'] = fwd_return_5min
+    feat['fwd_return_1h'] = fwd_return_1h
+    feat['fwd_return_1d'] = fwd_return_1d
+
+    # 1. Trend indicators
+    print("  [1/4] Trend indicators...")
+    close_s = pd.Series(close)
+    high_s = pd.Series(high)
+    low_s = pd.Series(low)
+    vol_s = pd.Series(volume)
+
+    for w in [5, 10, 20, 50, 200]:
+        feat[f'sma_{w}'] = compute_sma(close_s, w).values
+        feat[f'ema_{w}'] = compute_ema(close_s, w).values
+    feat['sma_ratio_5_20'] = feat['sma_5'] / np.where(feat['sma_20'] == 0, np.nan, feat['sma_20'])
+    feat['sma_ratio_20_50'] = feat['sma_20'] / np.where(feat['sma_50'] == 0, np.nan, feat['sma_50'])
+    feat['sma_ratio_50_200'] = feat['sma_50'] / np.where(feat['sma_200'] == 0, np.nan, feat['sma_200'])
+    feat['ema_diff_12_26'] = compute_ema(close_s, 12).values - compute_ema(close_s, 26).values
+    macd_line, macd_sig, macd_hist = compute_macd(close_s)
+    feat['macd_line'] = macd_line.values
+    feat['macd_signal'] = macd_sig.values
+    feat['macd_histogram'] = macd_hist.values
+    feat['adx_14'] = compute_adx(high_s, low_s, close_s, 14).values
+    feat['adx_28'] = compute_adx(high_s, low_s, close_s, 28).values
+
+    # 2. Momentum
+    print("  [2/4] Momentum indicators...")
+    for w in [7, 14, 28]:
+        feat[f'rsi_{w}'] = compute_rsi(close_s, w).values
+    feat['rsi_14_zscore'] = (feat['rsi_14'] - pd.Series(feat['rsi_14']).rolling(50).mean().values) / pd.Series(feat['rsi_14']).rolling(50).std().values
+    stoch_k, stoch_d = compute_stochastic(high_s, low_s, close_s, 14, 3)
+    feat['stoch_k'] = stoch_k.values
+    feat['stoch_d'] = stoch_d.values
+    feat['stoch_diff'] = feat['stoch_k'] - feat['stoch_d']
+    for w in [14, 28]:
+        feat[f'cci_{w}'] = compute_cci(high_s, low_s, close_s, w).values
+    for w in [5, 10, 20]:
+        feat[f'roc_{w}'] = compute_roc(close_s, w).values
+    feat['williams_r_14'] = compute_williams_r(high_s, low_s, close_s, 14).values
+
+    # 3. Volatility
+    print("  [3/4] Volatility indicators...")
+    for w in [14, 28]:
+        feat[f'atr_{w}'] = compute_atr(high_s, low_s, close_s, w).values
+    bb_upper, bb_mid, bb_lower = compute_bollinger_bands(close_s, 20, 2.0)
+    feat['bb_upper'] = bb_upper.values
+    feat['bb_mid'] = bb_mid.values
+    feat['bb_lower'] = bb_lower.values
+    feat['bb_width'] = (bb_upper - bb_mid).values / np.where(bb_mid.values == 0, np.nan, bb_mid.values)
+    feat['bb_percent_b'] = (close_s - bb_lower).values / np.where((bb_upper - bb_lower).values == 0, np.nan, (bb_upper - bb_lower).values)
+    feat['natr_14'] = feat['atr_14'] / np.where(close == 0, np.nan, close) * 100
+
+    # 4. Volume
+    print("  [4/4] Volume indicators...")
+    feat['obv'] = compute_obv(close_s, vol_s).values
+    feat['obv_roc'] = compute_roc(pd.Series(feat['obv']), 20).values
+    feat['mfi_14'] = compute_mfi(high_s, low_s, close_s, vol_s, 14).values
+    feat['cmf_20'] = compute_cmf(high_s, low_s, close_s, vol_s, 20).values
+    for w in [10, 20, 50]:
+        feat[f'volume_sma_{w}'] = compute_sma(vol_s, w).values
+        feat[f'volume_ratio_{w}'] = volume / np.where(feat[f'volume_sma_{w}'] == 0, np.nan, feat[f'volume_sma_{w}'])
+
+    # 5. Crypto-specific
+    print("  [5/6] Crypto-specific features...")
+    feat['volume_per_dollar'] = volume / np.where(close == 0, np.nan, close)
+    feat['volume_roc'] = compute_roc(pd.Series(volume), 20).values
+    feat['spread_roc'] = compute_roc(pd.Series(spread_proxy), 20).values
+    feat['spread_zscore'] = (spread_proxy - pd.Series(spread_proxy).rolling(50).mean().values) / pd.Series(spread_proxy).rolling(50).std().values
+    feat['price_volume_corr'] = pd.Series(close).rolling(20).corr(pd.Series(volume)).values
+    vol_short = pd.Series(np.abs(np.diff(close, prepend=close[0]))).rolling(5).std().values
+    vol_long = pd.Series(np.abs(np.diff(close, prepend=close[0]))).rolling(20).std().values
+    feat['vol_ratio_short_long'] = vol_short / np.where(vol_long == 0, np.nan, vol_long)
+    feat['intraday_gap'] = price_df['open'].values - np.roll(close, 1)
+
+    # 6. Cross-asset
+    print("  [6/6] Cross-asset features...")
+    feat['btc_eth_corr'] = pd.Series(btc_return).rolling(20).corr(pd.Series(eth_return)).values
+    eth_btc_ratio = eth_close / np.where(btc_close == 0, np.nan, btc_close)
+    feat['eth_btc_ratio'] = eth_btc_ratio
+    feat['eth_btc_ratio_roc5'] = compute_roc(pd.Series(eth_btc_ratio), 5).values
+    feat['eth_btc_ratio_roc20'] = compute_roc(pd.Series(eth_btc_ratio), 20).values
+    feat['eth_vs_btc_return'] = eth_return - btc_return
+    feat['eth_vs_btc_return_cum20'] = pd.Series(eth_return - btc_return).rolling(20).sum().values
+    total_crypto_ret = 0.7 * btc_return + 0.3 * eth_return
+    feat['btc_return_share'] = btc_return / np.where(total_crypto_ret == 0, np.nan, total_crypto_ret)
+    for lag in [1, 3, 5]:
+        feat[f'btc_leads_eth_lag{lag}'] = pd.Series(btc_return).corr(pd.Series(np.roll(eth_return, -lag))[:n])
+    feat['btc_return_positive_pct'] = pd.Series(btc_return).rolling(20).apply(lambda x: (x > 0).mean(), raw=True).values
+
+    # 7. Order flow (from trades)
+    if not trades_df.empty and 'side' in trades_df.columns:
+        print("  [Bonus] Order flow features...")
+        trades_df = trades_df.copy()
+        trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
+        trades_df = trades_df.sort_values('timestamp')
+
+        buy_vol = trades_df[trades_df['side'] == 'buy'].groupby('timestamp')['volume'].sum().reindex(price_df['timestamp']).fillna(0).values
+        sell_vol = trades_df[trades_df['side'] == 'sell'].groupby('timestamp')['volume'].sum().reindex(price_df['timestamp']).fillna(0).values
+        feat['ofi_depth1'] = buy_vol - sell_vol
+        feat['trade_count'] = trades_df.groupby('timestamp').size().reindex(price_df['timestamp']).fillna(0).values
+
+    # 8. Carry forward existing price features
+    for col in ['btc_return', 'eth_return', 'btc_close', 'eth_close', 'spread_proxy', 'btc_return_lag_1', 'btc_return_lag_3', 'eth_return_lag_1', 'eth_return_lag_3']:
+        if col in price_df.columns:
+            feat[col] = price_df[col].values
+
+    # ---- Build DataFrame ----
+    feat['timestamp'] = timestamps
+    result = pd.DataFrame(feat)
+
+    # Drop all-NaN columns
+    result = result.dropna(axis=1, how='all')
+
+    print(f"Feature library complete: {len(result.columns)-1} features computed")
+
+    # Save
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_parquet(output_path, index=False)
+    print(f"Saved to {output_path}")
+
+    # Print category summary
+    print("\nFeature categories:")
+    categories = {
+        'Trend': [c for c in result.columns if any(x in c for x in ['sma_', 'ema_', 'macd_', 'adx_'])],
+        'Momentum': [c for c in result.columns if any(x in c for x in ['rsi_', 'stoch', 'cci_', 'roc_', 'williams'])],
+        'Volatility': [c for c in result.columns if any(x in c for x in ['atr_', 'bb_', 'natr_'])],
+        'Volume': [c for c in result.columns if any(x in c for x in ['obv', 'mfi_', 'cmf_', 'volume_'])],
+        'Crypto': [c for c in result.columns if any(x in c for x in ['volume_per_dollar', 'spread_roc', 'vol_ratio', 'intraday_gap'])],
+        'Cross-Asset': [c for c in result.columns if any(x in c for x in ['corr', 'eth_btc_ratio', 'eth_vs', 'btc_leads', 'positive_pct'])],
+        'Order Flow': [c for c in result.columns if any(x in c for x in ['ofi_', 'trade_count'])],
+    }
+    for cat, cols in categories.items():
+        print(f"  {cat}: {len(cols)} features")
+
+    return result
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Layer 3b: Compute alpha feature library")
+    parser.add_argument("--prices", type=str, default="data/processed/price_features.parquet")
+    parser.add_argument("--trades", type=str, default="data/processed/trades_processed.parquet")
+    parser.add_argument("--output", type=str, default="data/processed/alpha_features.parquet")
+    args = parser.parse_args()
+
+    df = compute_alpha_features(args.prices, args.trades, args.output)
+    print(f"\nFinal shape: {df.shape}")

@@ -1,0 +1,131 @@
+{
+  "total_signals_screened": 210,
+  "total_horizons": 3,
+  "significant_count": 84,
+  "surviving_count": 0,
+  "best_oos_r2": 0.04973749311032738,
+  "best_ic": 0.17167089100696953,
+  "r2_threshold": 0.001,
+  "ic_threshold": 0.01,
+  "pvalue_threshold": 0.05,
+  "top_signals": [
+    {
+      "signal": "ofi_depth1",
+      "horizon": "5min",
+      "ic": 0.17167089100696953,
+      "oos_r2": 0.04973749311032738,
+      "oos_ic": 0.22331540893206436,
+      "p_value": 0.0,
+      "a_s_cost_bps": 2.15,
+      "expected_return_bps": 4.149932836292377,
+      "survival": false
+    },
+    {
+      "signal": "ofi_depth1",
+      "horizon": "1hour",
+      "ic": 0.09090796951502364,
+      "oos_r2": 0.0105771768250994,
+      "oos_ic": 0.10430207265252948,
+      "p_value": 0.0,
+      "a_s_cost_bps": 7.447818472546172,
+      "expected_return_bps": 7.067905701407402,
+      "survival": false
+    },
+    {
+      "signal": "natr_14",
+      "horizon": "1day",
+      "ic": 0.061427779096303516,
+      "oos_r2": 0.004830794040436626,
+      "oos_ic": 0.07611471672091807,
+      "p_value": 0.0,
+      "a_s_cost_bps": 36.486709909225844,
+      "expected_return_bps": 22.030859266415852,
+      "survival": false
+    },
+    {
+      "signal": "bb_width",
+      "horizon": "1day",
+      "ic": 0.04920220131744294,
+      "oos_r2": 0.002661974410471113,
+      "oos_ic": 0.057722133228572274,
+      "p_value": 0.0,
+      "a_s_cost_bps": 36.486709909225844,
+      "expected_return_bps": 17.644744603542215,
+      "survival": false
+    },
+    {
+      "signal": "bb_width",
+      "horizon": "1hour",
+      "ic": 0.03768166672519026,
+      "oos_r2": 0.0007850031120004708,
+      "oos_ic": 0.029671865340407253,
+      "p_value": 0.0,
+      "a_s_cost_bps": 7.447818472546172,
+      "expected_return_bps": 2.9294120212585573,
+      "survival": false
+    },
+    {
+      "signal": "volume_sma_10",
+      "horizon": "1hour",
+      "ic": 0.010791177187743079,
+      "oos_r2": 0.0002284653038920892,
+      "oos_ic": 0.028632071977342587,
+      "p_value": 0.0,
+      "a_s_cost_bps": 7.447818472546172,
+      "expected_return_bps": 0.8373989123902157,
+      "survival": false
+    },
+    {
+      "signal": "bb_width",
+      "horizon": "5min",
+      "ic": 0.014743147404120797,
+      "oos_r2": 0.00013199245406014803,
+      "oos_ic": 0.012434912741141085,
+      "p_value": 0.0,
+      "a_s_cost_bps": 2.15,
+      "expected_return_bps": 0.3562792879611083,
+      "survival": false
+    },
+    {
+      "signal": "volume_per_dollar",
+      "horizon": "1hour",
+      "ic": 0.018945125903504313,
+      "oos_r2": 4.713061225170012e-05,
+      "oos_ic": 0.031058977985397803,
+      "p_value": 0.0,
+      "a_s_cost_bps": 7.447818472546172,
+      "expected_return_bps": 1.4722080523757084,
+      "survival": false
+    },
+    {
+      "signal": "volume_per_dollar",
+      "horizon": "1day",
+      "ic": 0.026168408342099787,
+      "oos_r2": 3.1298491921849525e-05,
+      "oos_ic": 0.07779467443695467,
+      "p_value": 0.0,
+      "a_s_cost_bps": 36.486709909225844,
+      "expected_return_bps": 9.380887490492213,
+      "survival": false
+    },
+    {
+      "signal": "natr_14",
+      "horizon": "1hour",
+      "ic": 0.040978711868747776,
+      "oos_r2": 1.5048264123129762e-05,
+      "oos_ic": 0.024314870581288665,
+      "p_value": 0.0,
+      "a_s_cost_bps": 7.447818472546172,
+      "expected_return_bps": 3.1859605291442814,
+      "survival": false
+    }
+  ],
+  "5min_significant": 22,
+  "5min_surviving": 0,
+  "1hour_significant": 28,
+  "1hour_surviving": 0,
+  "1day_significant": 34,
+  "1day_surviving": 0,
+  "stopping_rule_triggered": false,
+  "verdict": "POSITIVE BUT NOT SURVIVING: OOS R2 meaningful but A&S costs consume edge"
+}
